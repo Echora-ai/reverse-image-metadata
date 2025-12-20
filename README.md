@@ -1,32 +1,88 @@
 # Reverse Image Attribution Service
 
-A Python service that performs reverse image search and extracts photographer attribution from known stock photo sites.
+A Python service that extracts photographer attribution from stock photo sites. **Scraping only - no API calls, no rate limits.**
+
+## Two Modes
+
+### 1. Direct URL Lookup (Recommended)
+
+If you already have a URL from Pexels, Pixabay, Getty, etc., use this endpoint. **No reverse search needed.**
+
+### 2. Reverse Image Search
+
+If you have an image and need to find where it came from, use reverse search.
 
 ## Features
 
-- **Reverse Image Search**: Uses Google Lens (via SerpAPI), Yandex, and Bing to find image sources
-- **Attribution Extraction**: Scrapes photographer credits from:
-  - Getty Images
-  - Shutterstock
-  - Unsplash (with free API support)
-  - Pexels (with free API support)
-  - Pixabay (with free API support)
-  - Flickr (with free API support)
-  - Alamy
-  - News sites (AP, Reuters, NYT)
-- **Confidence Scoring**: Ranks results by source reliability and data completeness
-- **Rate Limiting**: Built-in delays to avoid getting blocked
+- **Direct Scraping**: No API keys needed, no rate limits
+- **10 Sources Supported**: Getty, Shutterstock, Unsplash, Pexels, Pixabay, Flickr, Alamy, AP, Reuters, NYT
+- **Extracts**: Photographer name, license, title, location
+- **Ready for Cloud Run**: Dockerfile included
+
+---
 
 ## API Usage
 
-### POST /reverse-search
+### POST /get-attribution (Direct URL Lookup)
 
-Find photographer attribution for an image.
+**Best for**: When you already have a stock photo URL.
 
 **Request:**
 ```json
 {
-  "image_url": "https://example.com/photo.jpg",
+  "url": "https://www.pexels.com/photo/green-hill-near-body-of-water-462162/"
+}
+```
+
+**Response:**
+```json
+{
+  "found": true,
+  "url": "https://www.pexels.com/photo/green-hill-near-body-of-water-462162/",
+  "attribution": {
+    "source": "pexels",
+    "source_url": "https://www.pexels.com/photo/green-hill-near-body-of-water-462162/",
+    "photographer": "Pixabay",
+    "photographer_url": "https://www.pexels.com/@pixabay",
+    "license": "CC0 (Public Domain)",
+    "title": "Green Hill Near Body of Water",
+    "location": "United Kingdom",
+    "confidence": 1.0
+  }
+}
+```
+
+**Pixabay Example:**
+```json
+{
+  "url": "https://pixabay.com/photos/beach-sea-sunset-sun-sunlight-1751455/"
+}
+```
+
+**Response:**
+```json
+{
+  "found": true,
+  "url": "https://pixabay.com/photos/beach-sea-sunset-sun-sunlight-1751455/",
+  "attribution": {
+    "source": "pixabay",
+    "photographer": "12019",
+    "photographer_url": "https://pixabay.com/users/12019/",
+    "license": "Pixabay License",
+    "title": "Beach Sea Sunset Sun Sunlight",
+    "confidence": 1.0
+  }
+}
+```
+
+### POST /reverse-search
+
+**Best for**: When you have an image URL and need to find the source.
+
+**Request:**
+```json
+{
+  "image_url": "https://example.com/unknown-photo.jpg",
   "max_results": 10,
   "timeout": 30
 }
@@ -36,7 +92,7 @@ Find photographer attribution for an image.
 ```json
 {
   "found": true,
-  "image_url": "https://example.com/photo.jpg",
+  "image_url": "https://example.com/unknown-photo.jpg",
   "results": [
     {
       "source": "getty",
@@ -55,15 +111,26 @@ Find photographer attribution for an image.
 
 Health check endpoint for Cloud Run.
 
-## Environment Variables
+---
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SERPAPI_KEY` | No | SerpAPI key for Google Lens (improves results) |
-| `UNSPLASH_ACCESS_KEY` | No | Unsplash API key for better Unsplash extraction |
-| `PEXELS_API_KEY` | No | Pexels API key for better Pexels extraction |
-| `PIXABAY_API_KEY` | No | Pixabay API key for better Pixabay extraction |
-| `FLICKR_API_KEY` | No | Flickr API key for better Flickr extraction |
+## Supported Sources
+
+| Source | Scraping | Fields Extracted |
+|--------|----------|------------------|
+| **Pexels** | ✅ Page only | photographer, title, license (CC0/Pexels), location |
+| **Pixabay** | ✅ Page only | photographer, title, license (Pixabay License) |
+| **Unsplash** | ✅ Page only | photographer, title, license |
+| **Getty Images** | ✅ Page only | photographer, title, license |
+| **Shutterstock** | ✅ Page only | photographer, title, license |
+| **Flickr** | ✅ Page only | photographer, title, license |
+| **Alamy** | ✅ Page only | photographer, title, license |
+| **AP Images** | ✅ Page only | photographer, title |
+| **Reuters** | ✅ Page only | photographer, title |
+| **NYT** | ✅ Page only | photographer, title |
+
+**No API keys required.** We scrape pages directly.
+
+---
 
 ## Local Development
 
@@ -73,9 +140,6 @@ pip install -r requirements.txt
 
 # Run the server
 uvicorn main:app --reload --port 8080
-
-# Or with optional API keys
-SERPAPI_KEY=xxx uvicorn main:app --reload --port 8080
 ```
 
 ## Docker
@@ -86,23 +150,15 @@ docker build -t reverse-image-attribution .
 
 # Run
 docker run -p 8080:8080 reverse-image-attribution
-
-# With API keys
-docker run -p 8080:8080 \
-  -e SERPAPI_KEY=xxx \
-  -e UNSPLASH_ACCESS_KEY=xxx \
-  -e PEXELS_API_KEY=xxx \
-  -e PIXABAY_API_KEY=xxx \
-  reverse-image-attribution
 ```
 
 ## Deploy to Cloud Run
 
 ```bash
-# Build and push to Google Container Registry
+# Build and push
 gcloud builds submit --tag gcr.io/YOUR_PROJECT/reverse-image-attribution
 
-# Deploy to Cloud Run
+# Deploy
 gcloud run deploy reverse-image-attribution \
   --image gcr.io/YOUR_PROJECT/reverse-image-attribution \
   --platform managed \
@@ -110,51 +166,36 @@ gcloud run deploy reverse-image-attribution \
   --allow-unauthenticated
 ```
 
-## Architecture
-
-```
-Image URL
-    ↓
-Reverse Search (Google Lens / Yandex / Bing)
-    ↓
-Filter for known stock/news sites
-    ↓
-Scrape attribution from matched sites
-    ↓
-Return structured results with confidence scores
-```
-
-## Supported Sources
-
-| Source | Method | Attribution Fields | License |
-|--------|--------|--------------------| --------|
-| Getty Images | Scraping | photographer, license, title | Rights Managed / Royalty Free |
-| Shutterstock | Scraping | photographer, license, title | Royalty Free |
-| Unsplash | API + Scraping | photographer, license, title | Unsplash License (free) |
-| Pexels | API + Scraping | photographer, license, title | Pexels License (free) |
-| Pixabay | API + Scraping | photographer, license, title | Pixabay License (free) |
-| Flickr | API + Scraping | photographer, license, title | Various CC licenses |
-| Alamy | Scraping | photographer, license, title | Rights Managed / Royalty Free |
-| AP Images | Scraping | photographer, title | Editorial |
-| Reuters | Scraping | photographer, title | Editorial |
-| NYT | Scraping | photographer, title | Editorial |
-
-## Rate Limits
-
-- Built-in 0.5s delay between scrapes
-- Yandex/Bing free tier: ~1-2 requests/second
-- SerpAPI: depends on your plan (100 free searches/month)
-- Unsplash API: 50 requests/hour (demo), unlimited (production)
-- Pexels API: 200 requests/hour, 20,000/month (free)
-- Pixabay API: 5,000 requests/hour (free)
-- Flickr API: 3,600 requests/hour
+---
 
 ## Integration with Xano
 
-Call this service from a Xano task:
+### Direct URL Lookup (Recommended)
 
 ```javascript
 // In Xano function stack
+// Use when you already have a Pexels/Pixabay/etc URL
+
+var response = external_api_request({
+  url: "https://your-cloudrun-url/get-attribution",
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: { url: input.image_url }
+});
+
+if (response.found) {
+  var photographer = response.attribution.photographer;
+  var license = response.attribution.license;
+  var title = response.attribution.title;
+}
+```
+
+### Reverse Search
+
+```javascript
+// In Xano function stack
+// Use when you need to find where an image came from
+
 var response = external_api_request({
   url: "https://your-cloudrun-url/reverse-search",
   method: "POST",
@@ -162,9 +203,30 @@ var response = external_api_request({
   body: { image_url: input.asset_url }
 });
 
-if (response.found) {
-  // Update asset with attribution
-  var photographer = response.results[0].photographer;
-  var source_url = response.results[0].source_url;
+if (response.found && response.results.length > 0) {
+  var best_match = response.results[0];
+  var photographer = best_match.photographer;
+  var source_url = best_match.source_url;
 }
 ```
+
+---
+
+## Rate Limits
+
+**None!** We scrape pages directly, no APIs.
+
+Just be reasonable:
+- Built-in 0.5s delay between scrapes
+- Don't hammer sites with 1000 requests/second
+- That's it
+
+## Optional: Improve Reverse Search
+
+For better reverse search results, you can optionally add:
+
+| Variable | Purpose | Free Tier |
+|----------|---------|-----------|
+| `SERPAPI_KEY` | Google Lens reverse search | 100 searches/month |
+
+Without SerpAPI, we use Yandex and Bing (free, but less accurate).
