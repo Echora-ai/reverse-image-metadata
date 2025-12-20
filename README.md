@@ -9,6 +9,8 @@ A Python service that performs reverse image search and extracts photographer at
   - Getty Images
   - Shutterstock
   - Unsplash (with free API support)
+  - Pexels (with free API support)
+  - Pixabay (with free API support)
   - Flickr (with free API support)
   - Alamy
   - News sites (AP, Reuters, NYT)
@@ -59,6 +61,8 @@ Health check endpoint for Cloud Run.
 |----------|----------|-------------|
 | `SERPAPI_KEY` | No | SerpAPI key for Google Lens (improves results) |
 | `UNSPLASH_ACCESS_KEY` | No | Unsplash API key for better Unsplash extraction |
+| `PEXELS_API_KEY` | No | Pexels API key for better Pexels extraction |
+| `PIXABAY_API_KEY` | No | Pixabay API key for better Pixabay extraction |
 | `FLICKR_API_KEY` | No | Flickr API key for better Flickr extraction |
 
 ## Local Development
@@ -87,6 +91,8 @@ docker run -p 8080:8080 reverse-image-attribution
 docker run -p 8080:8080 \
   -e SERPAPI_KEY=xxx \
   -e UNSPLASH_ACCESS_KEY=xxx \
+  -e PEXELS_API_KEY=xxx \
+  -e PIXABAY_API_KEY=xxx \
   reverse-image-attribution
 ```
 
@@ -120,16 +126,18 @@ Return structured results with confidence scores
 
 ## Supported Sources
 
-| Source | Method | Attribution Fields |
-|--------|--------|--------------------|
-| Getty Images | Scraping | photographer, license, title |
-| Shutterstock | Scraping | photographer, license, title |
-| Unsplash | API + Scraping | photographer, license, title |
-| Flickr | API + Scraping | photographer, license, title |
-| Alamy | Scraping | photographer, license, title |
-| AP Images | Scraping | photographer, title |
-| Reuters | Scraping | photographer, title |
-| NYT | Scraping | photographer, title |
+| Source | Method | Attribution Fields | License |
+|--------|--------|--------------------| --------|
+| Getty Images | Scraping | photographer, license, title | Rights Managed / Royalty Free |
+| Shutterstock | Scraping | photographer, license, title | Royalty Free |
+| Unsplash | API + Scraping | photographer, license, title | Unsplash License (free) |
+| Pexels | API + Scraping | photographer, license, title | Pexels License (free) |
+| Pixabay | API + Scraping | photographer, license, title | Pixabay License (free) |
+| Flickr | API + Scraping | photographer, license, title | Various CC licenses |
+| Alamy | Scraping | photographer, license, title | Rights Managed / Royalty Free |
+| AP Images | Scraping | photographer, title | Editorial |
+| Reuters | Scraping | photographer, title | Editorial |
+| NYT | Scraping | photographer, title | Editorial |
 
 ## Rate Limits
 
@@ -137,7 +145,9 @@ Return structured results with confidence scores
 - Yandex/Bing free tier: ~1-2 requests/second
 - SerpAPI: depends on your plan (100 free searches/month)
 - Unsplash API: 50 requests/hour (demo), unlimited (production)
-- Flickr API: 3600 requests/hour
+- Pexels API: 200 requests/hour, 20,000/month (free)
+- Pixabay API: 5,000 requests/hour (free)
+- Flickr API: 3,600 requests/hour
 
 ## Integration with Xano
 
