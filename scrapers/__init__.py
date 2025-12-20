@@ -9,6 +9,8 @@ from .shutterstock import ShutterstockScraper
 from .unsplash import UnsplashScraper
 from .flickr import FlickrScraper
 from .alamy import AlamyScraper
+from .pexels import PexelsScraper
+from .pixabay import PixabayScraper
 from .news import NewsScraper
 
 # Priority order for known sources (most reliable first)
@@ -17,6 +19,8 @@ PRIORITY_DOMAINS = [
     "gettyimages.co.uk",
     "shutterstock.com",
     "unsplash.com",
+    "pexels.com",
+    "pixabay.com",
     "flickr.com",
     "alamy.com",
     "500px.com",
@@ -31,6 +35,8 @@ SCRAPER_MAP = {
     "gettyimages.co.uk": GettyScraper,
     "shutterstock.com": ShutterstockScraper,
     "unsplash.com": UnsplashScraper,
+    "pexels.com": PexelsScraper,
+    "pixabay.com": PixabayScraper,
     "flickr.com": FlickrScraper,
     "alamy.com": AlamyScraper,
     "apimages.com": NewsScraper,
@@ -69,6 +75,8 @@ __all__ = [
     "UnsplashScraper",
     "FlickrScraper",
     "AlamyScraper",
+    "PexelsScraper",
+    "PixabayScraper",
     "NewsScraper",
     "get_scraper_for_url",
     "PRIORITY_DOMAINS",
