@@ -1,7 +1,9 @@
 """Reverse Image Attribution Service
 
-A FastAPI service that performs reverse image search and extracts
-photographer attribution from known stock photo sites.
+A FastAPI service that extracts photographer attribution from known stock photo sites.
+Supports both:
+1. Direct URL lookup (pass a pexels/pixabay/etc URL, get attribution)
+2. Reverse image search (find where an image appears online)
 """
 
 import asyncio
@@ -20,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Reverse Image Attribution API",
-    description="Find photographer credits for images via reverse image search",
-    version="1.0.0"
+    description="Find photographer credits for images via direct URL lookup or reverse search",
+    version="1.1.0"
 )
 
 # CORS middleware
@@ -32,6 +34,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class DirectLookupRequest(BaseModel):
+    """Request model for direct URL attribution lookup"""
+    url: HttpUrl
 
 
 class SearchRequest(BaseModel):
@@ -46,9 +53,19 @@ class AttributionResult(BaseModel):
     source: str
     source_url: str
     photographer: Optional[str] = None
+    photographer_url: Optional[str] = None
     license: Optional[str] = None
     title: Optional[str] = None
+    location: Optional[str] = None
     confidence: float = 0.0
+
+
+class DirectLookupResponse(BaseModel):
+    """Response for direct URL lookup"""
+    found: bool
+    url: str
+    attribution: Optional[AttributionResult] = None
+    error: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -66,7 +83,11 @@ async def root():
     return {
         "status": "healthy",
         "service": "reverse-image-attribution",
-        "version": "1.0.0"
+        "version": "1.1.0",
+        "endpoints": {
+            "/get-attribution": "Direct URL lookup - pass a pexels/pixabay/etc URL",
+            "/reverse-search": "Find where an image appears online"
+        }
     }
 
 
@@ -74,6 +95,66 @@ async def root():
 async def health_check():
     """Health check for Cloud Run"""
     return {"status": "ok"}
+
+
+@app.post("/get-attribution", response_model=DirectLookupResponse)
+async def get_attribution(request: DirectLookupRequest):
+    """
+    Get photographer attribution from a direct URL.
+    
+    Pass a URL from Pexels, Pixabay, Unsplash, Flickr, Getty, Shutterstock, etc.
+    and get the photographer name, license, and other metadata.
+    
+    This does NOT use any APIs - it scrapes the page directly.
+    No rate limits to worry about.
+    """
+    url = str(request.url)
+    logger.info(f"Direct lookup for: {url}")
+    
+    # Get the right scraper for this URL
+    scraper = get_scraper_for_url(url)
+    
+    if not scraper:
+        # Check if it's a known domain we don't support
+        return DirectLookupResponse(
+            found=False,
+            url=url,
+            error=f"Unsupported domain. Supported: {', '.join(PRIORITY_DOMAINS[:6])}..."
+        )
+    
+    try:
+        # Scrape the page
+        attribution = await scraper.scrape(url)
+        
+        if not attribution:
+            return DirectLookupResponse(
+                found=False,
+                url=url,
+                error="Could not extract attribution from page"
+            )
+        
+        return DirectLookupResponse(
+            found=True,
+            url=url,
+            attribution=AttributionResult(
+                source=scraper.source_name,
+                source_url=url,
+                photographer=attribution.get("photographer"),
+                photographer_url=attribution.get("photographer_url"),
+                license=attribution.get("license"),
+                title=attribution.get("title"),
+                location=attribution.get("location"),
+                confidence=1.0  # Direct lookup = high confidence
+            )
+        )
+        
+    except Exception as e:
+        logger.error(f"Error scraping {url}: {e}")
+        return DirectLookupResponse(
+            found=False,
+            url=url,
+            error=str(e)
+        )
 
 
 @app.post("/reverse-search", response_model=SearchResponse)
@@ -120,8 +201,10 @@ async def reverse_search(request: SearchRequest):
                             source=scraper.source_name,
                             source_url=url,
                             photographer=attribution.get("photographer"),
+                            photographer_url=attribution.get("photographer_url"),
                             license=attribution.get("license"),
                             title=attribution.get("title"),
+                            location=attribution.get("location"),
                             confidence=_calculate_confidence(attribution, priority)
                         ))
                 except Exception as e:

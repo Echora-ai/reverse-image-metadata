@@ -1,12 +1,15 @@
-"""Pixabay scraper using their free API."""
+"""Pixabay scraper - page scraping only, no API.
 
-import os
+Scrapes photographer info directly from Pixabay photo pages.
+No rate limits to worry about.
+"""
+
 import re
 import json
 import logging
-import aiohttp
 from typing import Optional
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 from .base import BaseScraper
 
@@ -15,139 +18,103 @@ logger = logging.getLogger(__name__)
 
 class PixabayScraper(BaseScraper):
     """
-    Scraper for Pixabay.
+    Scraper for Pixabay - page scraping only.
     
-    Pixabay has a free API that provides detailed metadata.
     All Pixabay content is released under the Pixabay License
     (free for commercial use, no attribution required).
     
-    API: https://pixabay.com/api/docs/
-    Free tier: 5,000 requests/hour
+    We extract:
+    - Username (photographer/contributor)
+    - Photo title (from tags)
+    - License info
+    - Image type (photo, illustration, vector)
     """
     
     source_name = "pixabay"
     
-    def __init__(self):
-        super().__init__()
-        self.api_key = os.environ.get("PIXABAY_API_KEY")
-    
     async def _extract_attribution(self, soup: BeautifulSoup, url: str) -> Optional[dict]:
         """
-        Extract attribution from Pixabay page or API.
+        Extract attribution from Pixabay page by scraping HTML.
         """
         result = {
             "photographer": None,
+            "photographer_url": None,
             "license": "Pixabay License",
             "title": None,
         }
         
-        # Extract image ID from URL
-        image_id = self._extract_image_id(url)
-        
-        # Try API first if we have a key and image ID
-        if self.api_key and image_id:
-            api_result = await self._fetch_from_api(image_id)
-            if api_result:
-                return api_result
-        
-        # Fall back to page scraping
-        # Try JSON-LD schema
+        # Try JSON-LD schema first
         schema_data = self._extract_schema_data(soup)
         if schema_data:
             result.update(schema_data)
         
         # Look for user/photographer name
+        # Pixabay shows username with follower count
         if not result["photographer"]:
-            # Pixabay shows user with link to profile
+            # Look for links to /users/ profiles
             user_link = soup.find("a", href=re.compile(r"/users/[a-zA-Z0-9_-]+"))
             if user_link:
-                result["photographer"] = self._clean_text(user_link.get_text())
+                # The username is usually the text or in a child element
+                text = user_link.get_text()
+                if text and len(text) < 50:
+                    # Clean up - might have follower count
+                    text = re.sub(r"\d+[\s,]*followers?", "", text, flags=re.I).strip()
+                    result["photographer"] = self._clean_text(text)
+                    
+                    href = user_link.get("href", "")
+                    if href.startswith("/"):
+                        result["photographer_url"] = f"https://pixabay.com{href}"
+                    else:
+                        result["photographer_url"] = href
         
-        # Check for author in page text
+        # Also try to find username near the download button area
         if not result["photographer"]:
+            # Look for any text that looks like a username with followers
             text = soup.get_text()
-            patterns = [
-                r"Image by ([^|\n<]+)",
-                r"Photo by ([^|\n<]+)",
-                r"by ([^|\n<]+) from Pixabay",
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    photographer = self._clean_text(match.group(1))
-                    if photographer and len(photographer) < 50:
-                        result["photographer"] = photographer
-                        break
+            match = re.search(r"([a-zA-Z0-9_-]+)\s*[\n\s]*([\d,]+)\s*followers?", text, re.I)
+            if match:
+                result["photographer"] = match.group(1)
         
-        # Get title from meta or h1
+        # Get title from page title or og:title
         if not result["title"]:
             og_title = soup.find("meta", {"property": "og:title"})
             if og_title:
                 title = og_title.get("content", "")
-                # Clean up Pixabay title format
-                title = re.sub(r" - Free \w+ on Pixabay$", "", title)
+                # Pixabay titles often end with "- Free ... on Pixabay"
+                title = re.sub(r"\s*-\s*Free.*on Pixabay$", "", title, flags=re.I)
+                title = re.sub(r"\s*-\s*Free.*$", "", title, flags=re.I)
                 result["title"] = self._clean_text(title)
+        
+        # Also try extracting title from URL (tags are in URL)
+        if not result["title"]:
+            result["title"] = self._extract_title_from_url(url)
         
         if result["photographer"] or result["title"]:
             return result
         
         return None
     
-    def _extract_image_id(self, url: str) -> Optional[str]:
+    def _extract_title_from_url(self, url: str) -> Optional[str]:
         """
-        Extract Pixabay image ID from URL.
-        URLs like: pixabay.com/photos/description-1234567/
-        or: pixabay.com/images/id-1234567/
+        Extract title from Pixabay URL.
+        URLs like: pixabay.com/photos/beach-sea-sunset-sun-sunlight-1751455/
         """
-        # Try various URL patterns
-        patterns = [
-            r"pixabay\.com/(?:photos|images|illustrations|vectors)/[^/]*-(\d+)",
-            r"pixabay\.com/(?:photos|images|illustrations|vectors)/(\d+)",
-            r"id-(\d+)",
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        
-        return None
-    
-    async def _fetch_from_api(self, image_id: str) -> Optional[dict]:
-        """
-        Fetch image data from Pixabay API.
-        """
-        if not self.api_key:
-            return None
-        
         try:
-            # Pixabay API requires searching by ID
-            url = f"https://pixabay.com/api/?key={self.api_key}&id={image_id}"
+            parsed = urlparse(url)
+            path = parsed.path.strip("/")
             
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        hits = data.get("hits", [])
-                        if hits:
-                            hit = hits[0]
-                            
-                            return {
-                                "photographer": hit.get("user"),
-                                "photographer_id": hit.get("user_id"),
-                                "license": "Pixabay License",
-                                "title": hit.get("tags"),  # Pixabay uses tags as description
-                                "image_type": hit.get("type"),  # photo, illustration, vector
-                                "views": hit.get("views"),
-                                "downloads": hit.get("downloads"),
-                            }
-                    elif response.status == 404:
-                        logger.debug(f"Pixabay image not found: {image_id}")
-                    else:
-                        logger.warning(f"Pixabay API error: {response.status}")
-        except Exception as e:
-            logger.warning(f"Pixabay API error: {e}")
+            # Split path: photos/beach-sea-sunset-sun-sunlight-1751455
+            parts = path.split("/")
+            if len(parts) >= 2:
+                # Get the slug part: beach-sea-sunset-sun-sunlight-1751455
+                slug = parts[-1]
+                # Remove the ID at the end
+                slug = re.sub(r"-\d+$", "", slug)
+                # Replace hyphens with spaces and title case
+                title = slug.replace("-", " ").title()
+                return title
+        except Exception:
+            pass
         
         return None
     
@@ -166,15 +133,19 @@ class PixabayScraper(BaseScraper):
                     
                     if data.get("@type") in ["ImageObject", "Photograph", "CreativeWork"]:
                         photographer = None
+                        photographer_url = None
+                        
                         author = data.get("author") or data.get("creator")
                         if author:
                             if isinstance(author, dict):
                                 photographer = author.get("name")
+                                photographer_url = author.get("url")
                             elif isinstance(author, str):
                                 photographer = author
                         
                         return {
                             "photographer": self._clean_text(photographer),
+                            "photographer_url": photographer_url,
                             "title": self._clean_text(data.get("name") or data.get("description")),
                             "license": "Pixabay License",
                         }

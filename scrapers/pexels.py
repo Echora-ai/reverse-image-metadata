@@ -1,10 +1,12 @@
-"""Pexels scraper using their free API."""
+"""Pexels scraper - page scraping only, no API.
 
-import os
+Scrapes photographer info directly from Pexels photo pages.
+No rate limits to worry about.
+"""
+
 import re
 import json
 import logging
-import aiohttp
 from typing import Optional
 from bs4 import BeautifulSoup
 
@@ -15,120 +17,86 @@ logger = logging.getLogger(__name__)
 
 class PexelsScraper(BaseScraper):
     """
-    Scraper for Pexels.
+    Scraper for Pexels - page scraping only.
     
-    Pexels has a free API that provides photographer info.
     All Pexels photos are free to use under the Pexels License.
-    
-    API: https://www.pexels.com/api/
-    Free tier: 200 requests/hour, 20,000 requests/month
+    We extract:
+    - Photographer name (from profile link)
+    - Photo title
+    - License info (CC0 or Pexels License)
+    - Location (if available)
     """
     
     source_name = "pexels"
     
-    def __init__(self):
-        super().__init__()
-        self.api_key = os.environ.get("PEXELS_API_KEY")
-    
     async def _extract_attribution(self, soup: BeautifulSoup, url: str) -> Optional[dict]:
         """
-        Extract attribution from Pexels page or API.
+        Extract attribution from Pexels page by scraping HTML.
         """
         result = {
             "photographer": None,
+            "photographer_url": None,
             "license": "Pexels License",
             "title": None,
+            "location": None,
         }
         
-        # Extract photo ID from URL
-        photo_id = self._extract_photo_id(url)
-        
-        # Try API first if we have a key and photo ID
-        if self.api_key and photo_id:
-            api_result = await self._fetch_from_api(photo_id)
-            if api_result:
-                return api_result
-        
-        # Fall back to page scraping
-        # Try JSON-LD schema
+        # Try JSON-LD schema first (most reliable)
         schema_data = self._extract_schema_data(soup)
         if schema_data:
             result.update(schema_data)
         
-        # Look for photographer name in page
+        # Look for photographer name from profile link
+        # Pexels uses links like /@username
         if not result["photographer"]:
-            # Pexels shows photographer with link to profile
             photographer_link = soup.find("a", href=re.compile(r"/@[a-zA-Z0-9_-]+"))
             if photographer_link:
                 result["photographer"] = self._clean_text(photographer_link.get_text())
+                href = photographer_link.get("href", "")
+                if href.startswith("/"):
+                    result["photographer_url"] = f"https://www.pexels.com{href}"
+                else:
+                    result["photographer_url"] = href
         
-        # Also check for "Photo by X" pattern
+        # Also check for heading with photographer name
         if not result["photographer"]:
-            text = soup.get_text()
-            match = re.search(r"Photo by ([^|\n]+)", text, re.IGNORECASE)
-            if match:
-                result["photographer"] = self._clean_text(match.group(1))
+            # Look for h1 or h2 with photographer name pattern
+            for heading in soup.find_all(["h1", "h2"]):
+                text = heading.get_text()
+                if text and len(text) < 50 and not any(x in text.lower() for x in ["photo", "image", "free"]):
+                    result["photographer"] = self._clean_text(text)
+                    break
         
-        # Get title from meta
+        # Get title from og:title or page heading
         if not result["title"]:
             og_title = soup.find("meta", {"property": "og:title"})
             if og_title:
                 title = og_title.get("content", "")
-                # Pexels titles often include "Photo by X"
-                if " · " in title:
-                    result["title"] = self._clean_text(title.split(" · ")[0])
-                else:
-                    result["title"] = self._clean_text(title)
+                # Pexels titles often include "· Free Stock Photo"
+                title = re.sub(r"\s*[·|]\s*Free.*$", "", title, flags=re.IGNORECASE)
+                result["title"] = self._clean_text(title)
+        
+        # Try to get location from page
+        if not result["location"]:
+            # Pexels shows location with a flag icon
+            location_elem = soup.find(attrs={"data-testid": "photo-location"})
+            if location_elem:
+                result["location"] = self._clean_text(location_elem.get_text())
+            else:
+                # Look for location in structured content
+                for elem in soup.find_all(class_=re.compile(r"location", re.I)):
+                    text = elem.get_text()
+                    if text and len(text) < 100:
+                        result["location"] = self._clean_text(text)
+                        break
+        
+        # Check for CC0 license specifically
+        page_text = soup.get_text().lower()
+        if "cc0" in page_text or "public domain" in page_text:
+            result["license"] = "CC0 (Public Domain)"
         
         if result["photographer"] or result["title"]:
             return result
-        
-        return None
-    
-    def _extract_photo_id(self, url: str) -> Optional[str]:
-        """
-        Extract Pexels photo ID from URL.
-        URLs like: pexels.com/photo/description-1234567/
-        """
-        match = re.search(r"pexels\.com/photo/[^/]*-(\d+)", url)
-        if match:
-            return match.group(1)
-        # Also try direct ID pattern
-        match = re.search(r"pexels\.com/photo/(\d+)", url)
-        if match:
-            return match.group(1)
-        return None
-    
-    async def _fetch_from_api(self, photo_id: str) -> Optional[dict]:
-        """
-        Fetch photo data from Pexels API.
-        """
-        if not self.api_key:
-            return None
-        
-        try:
-            url = f"https://api.pexels.com/v1/photos/{photo_id}"
-            headers = {
-                "Authorization": self.api_key,
-            }
-            
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.get(url, headers=headers) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        return {
-                            "photographer": data.get("photographer"),
-                            "photographer_url": data.get("photographer_url"),
-                            "license": "Pexels License",
-                            "title": data.get("alt"),
-                        }
-                    elif response.status == 404:
-                        logger.debug(f"Pexels photo not found: {photo_id}")
-                    else:
-                        logger.warning(f"Pexels API error: {response.status}")
-        except Exception as e:
-            logger.warning(f"Pexels API error: {e}")
         
         return None
     
@@ -147,15 +115,19 @@ class PexelsScraper(BaseScraper):
                     
                     if data.get("@type") in ["ImageObject", "Photograph"]:
                         photographer = None
+                        photographer_url = None
+                        
                         author = data.get("author") or data.get("creator")
                         if author:
                             if isinstance(author, dict):
                                 photographer = author.get("name")
+                                photographer_url = author.get("url")
                             elif isinstance(author, str):
                                 photographer = author
                         
                         return {
                             "photographer": self._clean_text(photographer),
+                            "photographer_url": photographer_url,
                             "title": self._clean_text(data.get("name")),
                             "license": "Pexels License",
                         }
