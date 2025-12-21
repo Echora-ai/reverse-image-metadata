@@ -1,4 +1,4 @@
-"""Reverse Image Attribution Service with Playwright v4.1.0"""
+"""Reverse Image Attribution Service with Playwright v4.2.0"""
 
 import asyncio
 import logging
@@ -22,7 +22,7 @@ from playwright.async_api import async_playwright, Browser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="4.1.0")
+app = FastAPI(title="Reverse Image Attribution API", version="4.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Global browser instance
@@ -137,6 +137,77 @@ PRIORITY_DOMAINS = [
 ]
 
 
+# ============== LOCATION DETECTION HELPERS ==============
+
+# US state codes
+US_STATE_CODES = [
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga",
+    "hi", "id", "il", "in", "ia", "ks", "ky", "la", "me", "md",
+    "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj",
+    "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc",
+    "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc"
+]
+
+# Canadian provinces
+CA_PROVINCE_CODES = ["ab", "bc", "mb", "nb", "nl", "ns", "nt", "nu", "on", "pe", "qc", "sk", "yt"]
+
+# Common country indicators
+COUNTRY_INDICATORS = [
+    "united states", "usa", "u.s.a", "uk", "united kingdom", "canada", 
+    "australia", "germany", "france", "italy", "spain", "japan", "china",
+    "brazil", "mexico", "india", "netherlands", "sweden", "norway", "denmark",
+    "switzerland", "austria", "belgium", "portugal", "poland", "czech",
+    "greece", "turkey", "russia", "south korea", "singapore", "thailand",
+    "vietnam", "indonesia", "philippines", "malaysia", "new zealand"
+]
+
+
+def looks_like_location(text: str) -> bool:
+    """Check if text looks like a location (city, state, country format)."""
+    if not text or len(text) > 100 or len(text) < 3:
+        return False
+    
+    # Must contain comma for city, state/country format
+    if "," not in text:
+        return False
+    
+    parts = [p.strip() for p in text.split(",")]
+    
+    # Should have 2-4 parts (city, state) or (city, state, country) or (city, country)
+    if not (2 <= len(parts) <= 4):
+        return False
+    
+    # First part should be capitalized (city name)
+    first_part = parts[0]
+    if not first_part or not first_part[0].isupper():
+        return False
+    
+    text_lower = text.lower()
+    
+    # Check for country indicators
+    for country in COUNTRY_INDICATORS:
+        if country in text_lower:
+            return True
+    
+    # Check for US state codes (", XX" or ", XX,")
+    for state in US_STATE_CODES:
+        if f", {state}," in text_lower or text_lower.endswith(f", {state}"):
+            return True
+    
+    # Check for Canadian province codes
+    for prov in CA_PROVINCE_CODES:
+        if f", {prov}," in text_lower or text_lower.endswith(f", {prov}"):
+            return True
+    
+    # If second part is exactly 2 characters and uppercase, likely a state code
+    if len(parts) >= 2:
+        second_part = parts[1].strip()
+        if len(second_part) == 2 and second_part.isalpha():
+            return True
+    
+    return False
+
+
 # ============== PLAYWRIGHT SCRAPER ==============
 
 async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
@@ -200,45 +271,106 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
         if "pexels.com" in domain:
             logger.info("Pexels detected - using specific selectors")
             
-            # Try to find photographer by various methods
             try:
-                # Method 1: Look for photographer link with /@username pattern
-                photographer_links = await page.query_selector_all('a[href*="/@"]')
-                for link in photographer_links:
-                    href = await link.get_attribute("href")
-                    text = await link.inner_text()
-                    text = text.strip() if text else ""
-                    if text and len(text) < 100 and "/@" in (href or ""):
-                        # Skip navigation/menu links
-                        if text.lower() not in ["login", "join", "home", "explore", ""]:
-                            result["creator"] = text
-                            if href:
-                                result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
-                            logger.info(f"Found creator via /@link: {text}")
-                            break
+                # ===== PHOTOGRAPHER EXTRACTION =====
+                # Method 1: Look for heading elements inside links to /@username
+                # Pexels structure: <a href="/@username"><h2>Photographer Name</h2></a>
+                headings = await page.query_selector_all('h1, h2, h3, h4')
+                for heading in headings:
+                    parent = await heading.evaluate_handle('el => el.parentElement')
+                    if parent:
+                        tag_name = await parent.evaluate('el => el.tagName')
+                        if tag_name == 'A':
+                            href = await parent.evaluate('el => el.getAttribute("href")')
+                            if href and ("/@" in href or "/users/" in href):
+                                text = await heading.inner_text()
+                                if text and len(text.strip()) < 100:
+                                    result["creator"] = text.strip()
+                                    result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
+                                    logger.info(f"Found creator via heading in link: {result['creator']}")
+                                    break
                 
-                # Method 2: Look for photographer in h1 or title area
+                # Method 2: Look for photographer link with /@username pattern
                 if not result["creator"]:
+                    photographer_links = await page.query_selector_all('a[href*="/@"]')
+                    for link in photographer_links:
+                        href = await link.get_attribute("href")
+                        text = await link.inner_text()
+                        text = text.strip() if text else ""
+                        if text and len(text) < 100 and "/@" in (href or ""):
+                            # Skip navigation/menu links
+                            if text.lower() not in ["login", "join", "home", "explore", "upload", ""]:
+                                result["creator"] = text
+                                if href:
+                                    result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
+                                logger.info(f"Found creator via /@link: {text}")
+                                break
+                
+                # Method 3: Check for "Photo by" text pattern
+                if not result["creator"]:
+                    page_text = await page.content()
+                    photo_by_match = re.search(r'Photo\s+by\s+([^<>"\\n]{2,50})', page_text, re.IGNORECASE)
+                    if photo_by_match:
+                        creator = photo_by_match.group(1).strip()
+                        # Clean up common suffixes
+                        creator = re.sub(r'\s+on\s+Pexels.*$', '', creator, flags=re.IGNORECASE)
+                        if len(creator) < 100 and len(creator) > 1:
+                            result["creator"] = creator
+                            logger.info(f"Found creator via 'Photo by': {creator}")
+                
+                # ===== LOCATION EXTRACTION =====
+                # Method 1: Look for location in page text with comma-separated format
+                all_elements = await page.query_selector_all('span, div, p, a')
+                for elem in all_elements:
+                    try:
+                        text = await elem.inner_text()
+                        text = text.strip() if text else ""
+                        if looks_like_location(text):
+                            result["location"] = text
+                            logger.info(f"Found location via element text: {text}")
+                            break
+                    except:
+                        continue
+                
+                # Method 2: Look for specific location patterns in full page content
+                if not result["location"]:
+                    page_content = await page.content()
+                    # Pattern: "Tampa, FL, United States" or similar
+                    location_patterns = [
+                        r'([A-Z][a-zA-Z\s]+,\s*[A-Z]{2},\s*United States)',
+                        r'([A-Z][a-zA-Z\s]+,\s*[A-Z]{2},\s*USA)',
+                        r'([A-Z][a-zA-Z\s]+,\s*[A-Z][a-zA-Z\s]+,\s*[A-Z][a-zA-Z\s]+)',
+                    ]
+                    for pattern in location_patterns:
+                        match = re.search(pattern, page_content)
+                        if match:
+                            loc = match.group(1).strip()
+                            # Validate it's not too generic
+                            if len(loc) > 5 and "," in loc:
+                                result["location"] = loc
+                                logger.info(f"Found location via regex: {loc}")
+                                break
+                
+                # Method 3: Look for elements with location-related attributes
+                if not result["location"]:
+                    location_elems = await page.query_selector_all('[data-testid*="location"], [class*="location"], [class*="place"]')
+                    for elem in location_elems:
+                        try:
+                            text = await elem.inner_text()
+                            if text and len(text.strip()) < 100 and len(text.strip()) > 2:
+                                result["location"] = text.strip()
+                                logger.info(f"Found location via data-testid/class: {text.strip()}")
+                                break
+                        except:
+                            continue
+                
+                # ===== TITLE from h1 =====
+                if not result["title"]:
                     h1 = await page.query_selector('h1')
                     if h1:
                         h1_text = await h1.inner_text()
                         if h1_text:
                             result["title"] = h1_text.strip()
-                
-                # Method 3: Check for "Photo by" text
-                if not result["creator"]:
-                    page_text = await page.content()
-                    photo_by_match = re.search(r'Photo\s+by\s+([^<>"\n]+)', page_text, re.IGNORECASE)
-                    if photo_by_match:
-                        creator = photo_by_match.group(1).strip()
-                        if len(creator) < 100:
-                            result["creator"] = creator
-                            logger.info(f"Found creator via 'Photo by': {creator}")
-                
-                # Method 4: Look for location text
-                location_match = re.search(r'Location:\s*([^<>"\n]+)', await page.content(), re.IGNORECASE)
-                if location_match:
-                    result["location"] = location_match.group(1).strip()
                 
             except Exception as e:
                 logger.warning(f"Pexels-specific extraction error: {e}")
@@ -310,7 +442,7 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
                         elif isinstance(kw, str):
                             result["keywords"] = [k.strip() for k in kw.split(",")][:20]
                     
-                    logger.info(f"JSON-LD extracted: creator={result['creator']}")
+                    logger.info(f"JSON-LD extracted: creator={result['creator']}, location={result['location']}")
                     break
             except Exception as e:
                 logger.warning(f"JSON-LD parse error: {e}")
@@ -344,6 +476,16 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
             if desc:
                 result["description"] = desc.get("content", "").strip()[:500]
         
+        # ===== LOCATION FALLBACK from HTML =====
+        if not result["location"]:
+            # Try to find location in span/div elements
+            for elem in soup.find_all(["span", "div", "p", "a"]):
+                text = elem.get_text().strip()
+                if looks_like_location(text):
+                    result["location"] = text
+                    logger.info(f"Found location via BeautifulSoup: {text}")
+                    break
+        
         # ===== COPYRIGHT =====
         if result["creator"]:
             year = result["date_created"][:4] if result["date_created"] else None
@@ -357,7 +499,7 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
         else:
             result["scrape_status"] = "failed"
         
-        logger.info(f"Scrape complete: status={result['scrape_status']}, creator={result['creator']}, title={result['title']}")
+        logger.info(f"Scrape complete: status={result['scrape_status']}, creator={result['creator']}, location={result['location']}, title={result['title']}")
         return result
         
     except Exception as e:
@@ -479,7 +621,7 @@ def deduplicate_urls(urls: List[str]) -> List[str]:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.1.0", "browser": "playwright"}
+    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.2.0", "browser": "playwright"}
 
 @app.get("/health")
 async def health():
