@@ -1,4 +1,4 @@
-"""Reverse Image Attribution Service with Playwright v4.4.0"""
+"""Reverse Image Attribution Service with Playwright v4.5.0"""
 
 import asyncio
 import logging
@@ -22,8 +22,12 @@ from playwright.async_api import async_playwright, Browser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="4.4.0")
+app = FastAPI(title="Reverse Image Attribution API", version="4.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# API Keys from environment
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "")
 
 # Global browser instance
 _browser: Optional[Browser] = None
@@ -126,6 +130,73 @@ class SearchResponse(BaseModel):
     search_engines_used: List[str]
     total_matches_found: int = 0
     error: Optional[str] = None
+
+
+# ============== PEXELS API ==============
+
+def extract_pexels_photo_id(url: str) -> Optional[str]:
+    """Extract Pexels photo ID from various URL formats."""
+    patterns = [
+        r'/photos?/(\d+)',                          # /photos/15647646 or /photo/15647646
+        r'-(\d+)/?$',                               # slug-15647646/
+        r'pexels-photo-(\d+)',                      # pexels-photo-15647646.jpeg
+        r'/(\d+)(?:\?|$|/)',                        # /15647646/ or /15647646?
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            photo_id = match.group(1)
+            logger.info(f"Extracted Pexels photo ID: {photo_id} from {url}")
+            return photo_id
+    return None
+
+
+async def fetch_pexels_via_api(photo_id: str) -> Optional[dict]:
+    """Fetch photo metadata from Pexels API."""
+    if not PEXELS_API_KEY:
+        logger.info("No PEXELS_API_KEY set, skipping API lookup")
+        return None
+    
+    api_url = f"https://api.pexels.com/v1/photos/{photo_id}"
+    headers = {
+        "Authorization": PEXELS_API_KEY,
+        "User-Agent": "Echora Image Attribution Service"
+    }
+    
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(api_url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.info(f"Pexels API success for photo {photo_id}")
+                    
+                    # Extract metadata from API response
+                    result = {
+                        "title": data.get("alt") or f"Photo by {data.get('photographer', 'Unknown')}",
+                        "creator": data.get("photographer"),
+                        "creator_url": data.get("photographer_url"),
+                        "description": data.get("alt"),
+                        "keywords": [],
+                        "location": None,  # Pexels API doesn't provide location directly
+                        "license": "Pexels License",
+                        "date_created": None,
+                        "copyright": f"© {data.get('photographer')}" if data.get('photographer') else None,
+                        "source_url": data.get("url"),
+                        "scrape_status": "success"
+                    }
+                    
+                    logger.info(f"Pexels API returned: creator={result['creator']}, title={result['title']}")
+                    return result
+                    
+                elif resp.status == 404:
+                    logger.warning(f"Pexels photo {photo_id} not found via API")
+                else:
+                    logger.warning(f"Pexels API returned status {resp.status}")
+                    
+    except Exception as e:
+        logger.error(f"Pexels API error: {e}")
+    
+    return None
 
 
 # ============== URL TRANSFORMATION ==============
@@ -306,6 +377,15 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
         license_info = "Shutterstock License (Paid)"
     elif "gettyimages.com" in domain:
         license_info = "Getty Images License (Paid)"
+    
+    # ===== TRY PEXELS API FIRST =====
+    if "pexels.com" in url.lower():
+        photo_id = extract_pexels_photo_id(url)
+        if photo_id:
+            api_result = await fetch_pexels_via_api(photo_id)
+            if api_result:
+                return api_result
+            logger.info(f"Pexels API failed or unavailable, falling back to scraping")
     
     result = {
         "title": None,
@@ -726,7 +806,13 @@ def deduplicate_urls(urls: List[str]) -> List[str]:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.4.0", "browser": "playwright"}
+    return {
+        "status": "healthy", 
+        "service": "reverse-image-attribution", 
+        "version": "4.5.0", 
+        "browser": "playwright",
+        "pexels_api": "enabled" if PEXELS_API_KEY else "disabled"
+    }
 
 @app.get("/health")
 async def health():
