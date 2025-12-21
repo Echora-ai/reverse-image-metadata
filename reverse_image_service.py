@@ -1,4 +1,4 @@
-"""Reverse Image Attribution Service with Playwright v4.3.0"""
+"""Reverse Image Attribution Service with Playwright v4.4.0"""
 
 import asyncio
 import logging
@@ -22,7 +22,7 @@ from playwright.async_api import async_playwright, Browser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="4.3.0")
+app = FastAPI(title="Reverse Image Attribution API", version="4.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Global browser instance
@@ -43,10 +43,37 @@ async def get_browser() -> Browser:
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
                 '--disable-blink-features=AutomationControlled',
+                '--disable-infobars',
+                '--window-size=1920,1080',
+                '--start-maximized',
             ]
         )
         logger.info("Browser launched successfully")
     return _browser
+
+
+# Stealth mode init script to hide automation
+STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => undefined
+});
+
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5]
+});
+
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en']
+});
+
+window.chrome = {
+    runtime: {}
+};
+
+Object.defineProperty(navigator, 'platform', {
+    get: () => 'MacIntel'
+});
+"""
 
 
 @app.on_event("shutdown")
@@ -65,6 +92,11 @@ class SearchRequest(BaseModel):
     max_results: Optional[int] = 10
     timeout: Optional[int] = 30
     engines: Optional[List[str]] = None
+
+
+class DebugRequest(BaseModel):
+    url: str
+    timeout: Optional[int] = 30
 
 
 class ImageMetadata(BaseModel):
@@ -228,6 +260,35 @@ def looks_like_location(text: str) -> bool:
 
 # ============== PLAYWRIGHT SCRAPER ==============
 
+async def create_stealth_context(browser: Browser):
+    """Create a browser context with stealth settings."""
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport={"width": 1920, "height": 1080},
+        java_script_enabled=True,
+        locale="en-US",
+        timezone_id="America/New_York",
+        extra_http_headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"macOS"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    # Add stealth scripts
+    await context.add_init_script(STEALTH_SCRIPT)
+    return context
+
+
 async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
     """Scrape a page using Playwright (bypasses Cloudflare)."""
     page_url = transform_url_to_page(url)
@@ -264,11 +325,7 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
     context = None
     try:
         browser = await get_browser()
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            java_script_enabled=True,
-        )
+        context = await create_stealth_context(browser)
         page = await context.new_page()
         
         logger.info(f"Playwright: navigating to {page_url}")
@@ -669,11 +726,80 @@ def deduplicate_urls(urls: List[str]) -> List[str]:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.3.0", "browser": "playwright"}
+    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.4.0", "browser": "playwright"}
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/debug-scrape")
+async def debug_scrape(request: DebugRequest):
+    """Debug endpoint to see what the scraper sees on a page."""
+    url = request.url
+    timeout = request.timeout or 30
+    
+    context = None
+    try:
+        browser = await get_browser()
+        context = await create_stealth_context(browser)
+        page = await context.new_page()
+        
+        response = await page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+        
+        # Wait a bit for JS
+        await asyncio.sleep(3)
+        
+        final_url = page.url
+        status = response.status if response else None
+        
+        html = await page.content()
+        title = await page.title()
+        
+        # Count some useful elements
+        at_links = await page.query_selector_all('a[href*="/@"]')
+        h1_elements = await page.query_selector_all('h1')
+        h2_elements = await page.query_selector_all('h2')
+        
+        # Get h1 text
+        h1_text = None
+        if h1_elements:
+            h1_text = await h1_elements[0].inner_text()
+        
+        # Get first @ link
+        first_at_link = None
+        if at_links:
+            href = await at_links[0].get_attribute("href")
+            text = await at_links[0].inner_text()
+            first_at_link = {"href": href, "text": text}
+        
+        # Check for cloudflare
+        is_cloudflare = "Just a moment" in html or "Checking your browser" in html
+        
+        await context.close()
+        
+        return {
+            "url_requested": url,
+            "final_url": final_url,
+            "status": status,
+            "title": title,
+            "html_length": len(html),
+            "is_cloudflare_blocked": is_cloudflare,
+            "h1_text": h1_text,
+            "at_link_count": len(at_links),
+            "first_at_link": first_at_link,
+            "h1_count": len(h1_elements),
+            "h2_count": len(h2_elements),
+            "html_preview": html[:2000] if html else None,
+        }
+        
+    except Exception as e:
+        if context:
+            try:
+                await context.close()
+            except:
+                pass
+        return {"error": str(e), "url": url}
 
 
 @app.post("/reverse-search", response_model=SearchResponse)
