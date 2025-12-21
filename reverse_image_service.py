@@ -1,4 +1,4 @@
-"""Reverse Image Attribution Service with Playwright v4.2.0"""
+"""Reverse Image Attribution Service with Playwright v4.3.0"""
 
 import asyncio
 import logging
@@ -22,7 +22,7 @@ from playwright.async_api import async_playwright, Browser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="4.2.0")
+app = FastAPI(title="Reverse Image Attribution API", version="4.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Global browser instance
@@ -99,7 +99,14 @@ class SearchResponse(BaseModel):
 # ============== URL TRANSFORMATION ==============
 
 def transform_url_to_page(url: str) -> str:
-    """Transform CDN image URLs to their corresponding page URLs."""
+    """Transform CDN image URLs to their corresponding page URLs.
+    
+    For Pexels CDN URLs like:
+    https://images.pexels.com/photos/15647646/pexels-photo-15647646/free-photo-of-a-man-in-a-tank-top-and-pants-standing-outside.jpeg
+    
+    We extract the slug and ID to build:
+    https://www.pexels.com/photo/a-man-in-a-tank-top-and-pants-standing-outside-15647646/
+    """
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
@@ -107,10 +114,21 @@ def transform_url_to_page(url: str) -> str:
         
         # Pexels
         if "pexels.com" in domain:
+            # First try to extract photo ID
             match = re.search(r'/photos?/(\d+)', path)
             if match:
                 photo_id = match.group(1)
-                logger.info(f"Pexels: extracted ID {photo_id}")
+                
+                # Try to extract the slug from "free-photo-of-{slug}" pattern
+                slug_match = re.search(r'free-photo-of-([a-z0-9-]+)\.', path, re.IGNORECASE)
+                if slug_match:
+                    slug = slug_match.group(1)
+                    full_url = f"https://www.pexels.com/photo/{slug}-{photo_id}/"
+                    logger.info(f"Pexels: extracted slug '{slug}' and ID {photo_id} -> {full_url}")
+                    return full_url
+                
+                # Fallback: just use the ID (Pexels will redirect)
+                logger.info(f"Pexels: extracted ID {photo_id} (no slug found)")
                 return f"https://www.pexels.com/photo/{photo_id}/"
         
         # Unsplash
@@ -243,6 +261,7 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
     }
     
     page = None
+    context = None
     try:
         browser = await get_browser()
         context = await browser.new_context(
@@ -257,6 +276,11 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
         # Navigate and wait for network to be mostly idle
         response = await page.goto(page_url, wait_until="networkidle", timeout=timeout * 1000)
         
+        # Log the final URL after any redirects
+        final_url = page.url
+        logger.info(f"Final URL after redirect: {final_url}")
+        result["source_url"] = final_url
+        
         if response:
             logger.info(f"Response status: {response.status}")
             if response.status >= 400:
@@ -264,12 +288,21 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
                 await context.close()
                 return result
         
-        # Extra wait for JavaScript rendering
-        await asyncio.sleep(2)
-        
         # ===== PEXELS SPECIFIC =====
         if "pexels.com" in domain:
-            logger.info("Pexels detected - using specific selectors")
+            logger.info("Pexels detected - waiting for page elements to load...")
+            
+            # Wait for the main content to be visible - increased timeout
+            try:
+                # Wait for photographer link to appear (this is key!)
+                await page.wait_for_selector('a[href*="/@"]', timeout=10000)
+                logger.info("Photographer link selector found")
+            except Exception as e:
+                logger.warning(f"Timeout waiting for photographer link: {e}")
+            
+            # Additional wait for JavaScript rendering - INCREASED from 2s to 5s
+            await asyncio.sleep(5)
+            logger.info("Completed 5 second wait for JS rendering")
             
             try:
                 # ===== PHOTOGRAPHER EXTRACTION =====
@@ -277,36 +310,46 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
                 # Pexels structure: <a href="/@username"><h2>Photographer Name</h2></a>
                 headings = await page.query_selector_all('h1, h2, h3, h4')
                 for heading in headings:
-                    parent = await heading.evaluate_handle('el => el.parentElement')
-                    if parent:
-                        tag_name = await parent.evaluate('el => el.tagName')
-                        if tag_name == 'A':
-                            href = await parent.evaluate('el => el.getAttribute("href")')
-                            if href and ("/@" in href or "/users/" in href):
-                                text = await heading.inner_text()
-                                if text and len(text.strip()) < 100:
-                                    result["creator"] = text.strip()
-                                    result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
-                                    logger.info(f"Found creator via heading in link: {result['creator']}")
-                                    break
+                    try:
+                        parent = await heading.evaluate_handle('el => el.parentElement')
+                        if parent:
+                            tag_name = await parent.evaluate('el => el.tagName')
+                            if tag_name == 'A':
+                                href = await parent.evaluate('el => el.getAttribute("href")')
+                                if href and ("/@" in href or "/users/" in href):
+                                    text = await heading.inner_text()
+                                    if text and len(text.strip()) < 100:
+                                        result["creator"] = text.strip()
+                                        result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
+                                        logger.info(f"Found creator via heading in link: {result['creator']}")
+                                        break
+                    except Exception as inner_e:
+                        logger.debug(f"Heading check error: {inner_e}")
+                        continue
                 
                 # Method 2: Look for photographer link with /@username pattern
                 if not result["creator"]:
                     photographer_links = await page.query_selector_all('a[href*="/@"]')
+                    logger.info(f"Found {len(photographer_links)} links with /@")
                     for link in photographer_links:
-                        href = await link.get_attribute("href")
-                        text = await link.inner_text()
-                        text = text.strip() if text else ""
-                        if text and len(text) < 100 and "/@" in (href or ""):
-                            # Skip navigation/menu links
-                            if text.lower() not in ["login", "join", "home", "explore", "upload", ""]:
-                                result["creator"] = text
-                                if href:
-                                    result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
-                                logger.info(f"Found creator via /@link: {text}")
-                                break
+                        try:
+                            href = await link.get_attribute("href")
+                            text = await link.inner_text()
+                            text = text.strip() if text else ""
+                            logger.info(f"Checking link: href={href}, text='{text}'")
+                            if text and len(text) < 100 and "/@" in (href or ""):
+                                # Skip navigation/menu links
+                                if text.lower() not in ["login", "join", "home", "explore", "upload", "", "follow"]:
+                                    result["creator"] = text
+                                    if href:
+                                        result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
+                                    logger.info(f"Found creator via /@link: {text}")
+                                    break
+                        except Exception as link_e:
+                            logger.debug(f"Link check error: {link_e}")
+                            continue
                 
-                # Method 3: Check for "Photo by" text pattern
+                # Method 3: Check for "Photo by" text pattern in page content
                 if not result["creator"]:
                     page_text = await page.content()
                     photo_by_match = re.search(r'Photo\s+by\s+([^<>"\\n]{2,50})', page_text, re.IGNORECASE)
@@ -371,13 +414,18 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
                         h1_text = await h1.inner_text()
                         if h1_text:
                             result["title"] = h1_text.strip()
+                            logger.info(f"Found title: {result['title']}")
                 
             except Exception as e:
                 logger.warning(f"Pexels-specific extraction error: {e}")
+        else:
+            # Non-Pexels sites - standard wait
+            await asyncio.sleep(3)
         
         # Get full page HTML for further parsing
         html = await page.content()
         await context.close()
+        context = None
         
         if not html or len(html) < 500:
             logger.warning(f"Page HTML too short: {len(html) if html else 0} bytes")
@@ -505,9 +553,9 @@ async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
     except Exception as e:
         logger.error(f"Playwright error for {page_url}: {e}")
         result["scrape_status"] = "failed"
-        if page:
+        if context:
             try:
-                await page.context.close()
+                await context.close()
             except:
                 pass
         return result
@@ -621,7 +669,7 @@ def deduplicate_urls(urls: List[str]) -> List[str]:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.2.0", "browser": "playwright"}
+    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.3.0", "browser": "playwright"}
 
 @app.get("/health")
 async def health():
