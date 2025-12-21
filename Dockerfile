@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy all Python files
-COPY *.py .
+COPY *.py ./
 
 EXPOSE 8080
 
