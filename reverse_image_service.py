@@ -1,4 +1,4 @@
-"""Reverse Image Attribution Service with Playwright v4.7.0"""
+"""Reverse Image Attribution Service with Playwright v4.8.0"""
 
 import asyncio
 import logging
@@ -22,7 +22,7 @@ from playwright.async_api import async_playwright, Browser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="4.7.0")
+app = FastAPI(title="Reverse Image Attribution API", version="4.8.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ============== API KEYS ==============
@@ -282,6 +282,70 @@ def extract_pexels_metadata_from_urls(urls: List[str]) -> dict:
         result["source_url"] = f"https://www.pexels.com/photo/{slug}-{result['photo_id']}/"
     
     return result
+
+
+def is_pexels_url(url: str) -> bool:
+    """Check if URL is from Pexels."""
+    return "pexels.com" in url.lower()
+
+
+async def get_pexels_metadata_direct(image_url: str) -> Optional[ImageMetadata]:
+    """
+    Directly fetch metadata for a Pexels image URL using the API.
+    Returns ImageMetadata if successful, None otherwise.
+    """
+    photo_id, url_title = extract_pexels_info_from_url(image_url)
+    if not photo_id:
+        logger.warning(f"Could not extract Pexels photo ID from: {image_url}")
+        return None
+    
+    # Try API
+    api_result = await fetch_pexels_via_api(photo_id)
+    
+    if api_result:
+        url_hash = hashlib.md5(image_url.encode()).hexdigest()[:8]
+        return ImageMetadata(
+            type="image",
+            id=f"img_{url_hash}",
+            title=api_result.get("title"),
+            creator=api_result.get("creator"),
+            creator_url=api_result.get("creator_url"),
+            date_created=api_result.get("date_created"),
+            description=api_result.get("description"),
+            keywords=api_result.get("keywords", []),
+            location=api_result.get("location"),
+            copyright=api_result.get("copyright"),
+            license=api_result.get("license"),
+            source_url=api_result.get("source_url"),
+            source_domain="pexels",
+            confidence=0.95,
+            scrape_status="success"
+        )
+    
+    # API failed - return partial data from URL
+    source_url = f"https://www.pexels.com/photo/{photo_id}/"
+    if url_title:
+        slug = url_title.lower().replace(' ', '-')
+        source_url = f"https://www.pexels.com/photo/{slug}-{photo_id}/"
+    
+    url_hash = hashlib.md5(image_url.encode()).hexdigest()[:8]
+    return ImageMetadata(
+        type="image",
+        id=f"img_{url_hash}",
+        title=url_title,
+        creator=None,
+        creator_url=None,
+        date_created=None,
+        description=url_title,
+        keywords=[],
+        location=None,
+        copyright=None,
+        license="Pexels License",
+        source_url=source_url,
+        source_domain="pexels",
+        confidence=0.5,
+        scrape_status="partial"
+    )
 
 
 # ============== URL TRANSFORMATION ==============
@@ -609,7 +673,7 @@ async def root():
     return {
         "status": "healthy", 
         "service": "reverse-image-attribution", 
-        "version": "4.7.0", 
+        "version": "4.8.0", 
         "pexels_api_keys": pexels_status if pexels_status else ["none configured"],
         "env_vars_needed": ["PEXELS_API_KEY", "PEXELS_API_KEY_BACKUP"]
     }
@@ -648,6 +712,34 @@ async def reverse_search(request: SearchRequest):
     logger.info(f"Reverse search for: {image_url}")
     
     try:
+        # ===== FAST PATH: If input URL is from Pexels, use API directly =====
+        if is_pexels_url(image_url):
+            logger.info("Input URL is from Pexels - using direct API lookup")
+            pexels_result = await get_pexels_metadata_direct(image_url)
+            
+            if pexels_result and pexels_result.scrape_status == "success":
+                return SearchResponse(
+                    found=True,
+                    image_url=image_url,
+                    results=[pexels_result],
+                    matched_urls=[image_url],
+                    search_engines_used=["pexels_api"],
+                    total_matches_found=1,
+                    error=None
+                )
+            elif pexels_result:
+                # Partial result - still return it but note the issue
+                return SearchResponse(
+                    found=True,
+                    image_url=image_url,
+                    results=[pexels_result],
+                    matched_urls=[image_url],
+                    search_engines_used=["pexels_api"],
+                    total_matches_found=1,
+                    error="Pexels API unavailable - partial data from URL" if not pexels_result.creator else None
+                )
+        
+        # ===== REGULAR PATH: Do reverse image search =====
         search_result = await perform_search(image_url, request.timeout or 30)
         raw_urls = list(search_result.urls)
         
