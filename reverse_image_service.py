@@ -20,18 +20,23 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="3.0.0")
+app = FastAPI(title="Reverse Image Attribution API", version="3.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# User agents for rotation
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-]
-
-def get_random_user_agent():
-    return random.choice(USER_AGENTS)
+# Realistic browser headers
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 
 
 # ============== MODELS ==============
@@ -81,20 +86,27 @@ def transform_url_to_page(url: str) -> str:
         domain = parsed.netloc.lower()
         path = parsed.path
         
-        if "images.pexels.com" in domain:
-            match = re.search(r'/photos/(\d+)/', path)
+        # Pexels: images.pexels.com/photos/ID/... -> www.pexels.com/photo/ID/
+        if "images.pexels.com" in domain or "pexels.com" in domain:
+            match = re.search(r'/photos?/(\d+)', path)
             if match:
-                return f"https://www.pexels.com/photo/{match.group(1)}/"
+                photo_id = match.group(1)
+                logger.info(f"Pexels transform: {url} -> https://www.pexels.com/photo/{photo_id}/")
+                return f"https://www.pexels.com/photo/{photo_id}/"
         
-        if "images.unsplash.com" in domain:
+        # Unsplash: images.unsplash.com/photo-ID... -> unsplash.com/photos/ID
+        if "images.unsplash.com" in domain or "unsplash.com" in domain:
             match = re.search(r'photo-([a-zA-Z0-9_-]+)', path)
             if match:
-                return f"https://unsplash.com/photos/{match.group(1)}"
+                photo_id = match.group(1)
+                return f"https://unsplash.com/photos/{photo_id}"
         
+        # Pixabay: cdn.pixabay.com/photo/YYYY/MM/DD/HH/MM/name-ID.ext
         if "pixabay.com" in domain and "/photo/" in path:
             match = re.search(r'-(\d+)\.[a-z]+$', path, re.IGNORECASE)
             if match:
-                return f"https://pixabay.com/photos/id-{match.group(1)}/"
+                photo_id = match.group(1)
+                return f"https://pixabay.com/photos/id-{photo_id}/"
     except Exception as e:
         logger.warning(f"URL transform failed: {e}")
     
@@ -110,8 +122,76 @@ PRIORITY_DOMAINS = [
 
 # ============== SCRAPER ==============
 
+async def fetch_page(url: str, timeout: int = 15, retry: int = 0) -> Optional[str]:
+    """Fetch a page with retries and delays."""
+    try:
+        # Add small random delay to be polite
+        if retry > 0:
+            await asyncio.sleep(1 + random.random())
+        
+        connector = aiohttp.TCPConnector(ssl=False)  # Sometimes helps with SSL issues
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            connector=connector,
+            headers=BROWSER_HEADERS
+        ) as session:
+            async with session.get(url, allow_redirects=True) as response:
+                logger.info(f"Fetch {url} -> Status: {response.status}")
+                
+                if response.status == 403:
+                    logger.warning(f"403 Forbidden for {url}")
+                    return None
+                
+                if response.status != 200:
+                    logger.warning(f"HTTP {response.status} for {url}")
+                    return None
+                
+                content_type = response.headers.get("Content-Type", "")
+                if "image/" in content_type:
+                    logger.warning(f"Got image content-type for {url}")
+                    return None
+                
+                html = await response.text()
+                
+                # Check for Cloudflare challenge
+                if "Just a moment" in html[:1000] or "_cf_chl_opt" in html[:2000]:
+                    logger.warning(f"Cloudflare challenge detected for {url}")
+                    if retry < 2:
+                        await asyncio.sleep(2)
+                        return await fetch_page(url, timeout, retry + 1)
+                    return None
+                
+                return html
+                
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout fetching {url}")
+        return None
+    except Exception as e:
+        logger.error(f"Fetch error for {url}: {e}")
+        return None
+
+
 async def scrape_page(url: str, timeout: int = 15) -> dict:
     """Scrape metadata from a page URL."""
+    # Always transform the URL first
+    page_url = transform_url_to_page(url)
+    domain = urlparse(page_url).netloc.lower()
+    
+    # Determine license based on domain
+    license_info = None
+    if "pexels.com" in domain:
+        license_info = "Pexels License"
+    elif "unsplash.com" in domain:
+        license_info = "Unsplash License"
+    elif "pixabay.com" in domain:
+        license_info = "Pixabay License"
+    elif "flickr.com" in domain:
+        license_info = "Various (check source)"
+    elif "shutterstock.com" in domain:
+        license_info = "Shutterstock License (Paid)"
+    elif "gettyimages.com" in domain:
+        license_info = "Getty Images License (Paid)"
+    
     result = {
         "type": "image",
         "title": None,
@@ -120,42 +200,24 @@ async def scrape_page(url: str, timeout: int = 15) -> dict:
         "description": None,
         "keywords": [],
         "location": None,
-        "license": None,
+        "license": license_info,
         "date_created": None,
         "copyright": None,
-        "source_url": url,
+        "source_url": page_url,  # Always use the transformed URL
         "scrape_status": "pending"
     }
     
-    page_url = transform_url_to_page(url)
+    html = await fetch_page(page_url, timeout)
+    
+    if not html:
+        result["scrape_status"] = "failed"
+        logger.warning(f"Failed to fetch {page_url}")
+        return result
     
     try:
-        headers = {
-            "User-Agent": get_random_user_agent(),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(page_url, headers=headers, allow_redirects=True) as response:
-                if response.status != 200:
-                    result["scrape_status"] = "failed"
-                    return result
-                
-                content_type = response.headers.get("Content-Type", "")
-                if "image/" in content_type:
-                    result["scrape_status"] = "failed"
-                    return result
-                
-                html = await response.text()
-        
-        if not html or "Just a moment" in html[:500]:
-            result["scrape_status"] = "failed"
-            return result
-        
         soup = BeautifulSoup(html, "html.parser")
         
-        # Try JSON-LD first
+        # ===== Try JSON-LD first (most reliable) =====
         for script in soup.find_all("script", {"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string) if script.string else {}
@@ -183,15 +245,34 @@ async def scrape_page(url: str, timeout: int = 15) -> dict:
                         result["keywords"] = kw[:20]
                     elif isinstance(kw, str):
                         result["keywords"] = [k.strip() for k in kw.split(",")][:20]
+                    logger.info(f"Extracted from JSON-LD: creator={result['creator']}, title={result['title']}")
                     break
             except:
                 pass
         
-        # Fallback to meta tags
+        # ===== Pexels-specific extraction =====
+        if "pexels.com" in domain and not result["creator"]:
+            # Look for photographer link
+            for link in soup.find_all("a", href=re.compile(r'/@[a-zA-Z0-9_-]+')):
+                text = link.get_text().strip()
+                if text and len(text) < 100:
+                    result["creator"] = text
+                    href = link.get("href", "")
+                    if href.startswith("/"):
+                        result["creator_url"] = f"https://www.pexels.com{href}"
+                    else:
+                        result["creator_url"] = href
+                    logger.info(f"Found Pexels photographer: {text}")
+                    break
+        
+        # ===== Fallback to meta tags =====
         if not result["title"]:
             og = soup.find("meta", {"property": "og:title"})
             if og:
-                result["title"] = og.get("content", "").strip()
+                title = og.get("content", "").strip()
+                # Clean up common suffixes
+                title = re.sub(r'\s*[·|\-]\s*(Pexels|Unsplash|Pixabay|Photo).*$', '', title, flags=re.IGNORECASE)
+                result["title"] = title
         
         if not result["creator"]:
             author = soup.find("meta", {"name": "author"})
@@ -202,21 +283,6 @@ async def scrape_page(url: str, timeout: int = 15) -> dict:
             desc = soup.find("meta", {"property": "og:description"}) or soup.find("meta", {"name": "description"})
             if desc:
                 result["description"] = desc.get("content", "").strip()[:500]
-        
-        # Determine domain-specific license
-        domain = urlparse(page_url).netloc.lower()
-        if "pexels.com" in domain:
-            result["license"] = "Pexels License"
-        elif "unsplash.com" in domain:
-            result["license"] = "Unsplash License"
-        elif "pixabay.com" in domain:
-            result["license"] = "Pixabay License"
-        elif "flickr.com" in domain:
-            result["license"] = "Various (check source)"
-        elif "shutterstock.com" in domain:
-            result["license"] = "Shutterstock License (Paid)"
-        elif "gettyimages.com" in domain:
-            result["license"] = "Getty Images License (Paid)"
         
         # Build copyright
         if result["creator"]:
@@ -234,11 +300,11 @@ async def scrape_page(url: str, timeout: int = 15) -> dict:
         else:
             result["scrape_status"] = "failed"
         
-        result["source_url"] = page_url
+        logger.info(f"Scrape result for {page_url}: status={result['scrape_status']}, creator={result['creator']}")
         return result
         
     except Exception as e:
-        logger.error(f"Scrape error for {url}: {e}")
+        logger.error(f"Parse error for {page_url}: {e}")
         result["scrape_status"] = "failed"
         return result
 
@@ -276,17 +342,16 @@ class SearchResult:
 async def search_yandex(image_url: str, timeout: int = 30) -> tuple:
     """Search using Yandex Images."""
     urls = []
-    headers = {
-        "User-Agent": get_random_user_agent(),
-        "Accept": "text/html,application/xhtml+xml",
-    }
     
     try:
         encoded = quote_plus(image_url)
         search_url = f"https://yandex.com/images/search?rpt=imageview&url={encoded}"
         
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(search_url, headers=headers) as resp:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers=BROWSER_HEADERS
+        ) as session:
+            async with session.get(search_url) as resp:
                 if resp.status != 200:
                     return ("yandex", [], f"HTTP {resp.status}")
                 html = await resp.text()
@@ -305,17 +370,16 @@ async def search_yandex(image_url: str, timeout: int = 30) -> tuple:
 async def search_bing(image_url: str, timeout: int = 30) -> tuple:
     """Search using Bing Images."""
     urls = []
-    headers = {
-        "User-Agent": get_random_user_agent(),
-        "Accept": "text/html,application/xhtml+xml",
-    }
     
     try:
         encoded = quote_plus(image_url)
         search_url = f"https://www.bing.com/images/search?view=detailv2&iss=sbi&q=imgurl:{encoded}"
         
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            async with session.get(search_url, headers=headers, allow_redirects=True) as resp:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers=BROWSER_HEADERS
+        ) as session:
+            async with session.get(search_url, allow_redirects=True) as resp:
                 if resp.status != 200:
                     return ("bing", [], f"HTTP {resp.status}")
                 html = await resp.text()
@@ -359,11 +423,42 @@ async def perform_search(image_url: str, timeout: int = 30) -> SearchResult:
     return result
 
 
+def deduplicate_urls(urls: List[str]) -> List[str]:
+    """Deduplicate URLs by their photo ID."""
+    seen_ids = set()
+    unique = []
+    
+    for url in urls:
+        photo_id = None
+        
+        if "pexels.com" in url:
+            match = re.search(r'/photos?/(\d+)', url)
+            if match:
+                photo_id = f"pexels_{match.group(1)}"
+        elif "unsplash.com" in url:
+            match = re.search(r'photo[s-]?([a-zA-Z0-9_-]+)', url)
+            if match:
+                photo_id = f"unsplash_{match.group(1)}"
+        elif "pixabay.com" in url:
+            match = re.search(r'-(\d+)', url)
+            if match:
+                photo_id = f"pixabay_{match.group(1)}"
+        
+        if photo_id:
+            if photo_id in seen_ids:
+                continue
+            seen_ids.add(photo_id)
+        
+        unique.append(url)
+    
+    return unique
+
+
 # ============== ENDPOINTS ==============
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "3.0.0"}
+    return {"status": "healthy", "service": "reverse-image-attribution", "version": "3.1.0"}
 
 
 @app.get("/health")
@@ -391,9 +486,12 @@ async def reverse_search(request: SearchRequest):
                 error="; ".join(search_result.errors) if search_result.errors else "No matches found"
             )
         
+        # Deduplicate URLs
+        unique_urls = deduplicate_urls(search_result.urls)
+        
         # Prioritize known stock photo domains
         prioritized = []
-        for url in search_result.urls:
+        for url in unique_urls:
             priority = 0
             for i, domain in enumerate(PRIORITY_DOMAINS):
                 if domain in url.lower():
@@ -402,9 +500,9 @@ async def reverse_search(request: SearchRequest):
             prioritized.append((url, priority))
         prioritized.sort(key=lambda x: -x[1])
         
-        # Scrape top results
+        # Scrape top results (only unique photos)
         results = []
-        max_scrape = min(request.max_results or 10, 8)
+        max_scrape = min(request.max_results or 10, 5)  # Limit to reduce timeouts
         
         for url, priority in prioritized[:max_scrape]:
             metadata = await scrape_page(url)
@@ -440,7 +538,8 @@ async def reverse_search(request: SearchRequest):
                 scrape_status=metadata.get("scrape_status", "unknown")
             ))
             
-            await asyncio.sleep(0.2)
+            # Small delay between requests
+            await asyncio.sleep(0.5)
         
         results.sort(key=lambda x: x.confidence, reverse=True)
         
