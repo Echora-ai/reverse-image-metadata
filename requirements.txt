@@ -1,19 +1,6 @@
-# Reverse Image Attribution Service
-# Python 3.11+
-
-# Web framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-
-# HTTP client
-aiohttp==3.9.1
-
-# HTML parsing
-beautifulsoup4==4.12.3
-lxml==5.1.0
-
-# Data validation
-pydantic==2.5.3
-
-# Environment variables
-python-dotenv==1.0.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
