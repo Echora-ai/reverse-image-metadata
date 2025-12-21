@@ -1,4 +1,4 @@
-"""Reverse Image Attribution Service with Playwright v4.6.0"""
+"""Reverse Image Attribution Service with Playwright v4.7.0"""
 
 import asyncio
 import logging
@@ -22,11 +22,16 @@ from playwright.async_api import async_playwright, Browser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="4.6.0")
+app = FastAPI(title="Reverse Image Attribution API", version="4.7.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# API Keys from environment
+# ============== API KEYS ==============
+# Primary and backup Pexels API keys
+# Set these in Cloud Run environment variables:
+#   PEXELS_API_KEY - Primary key (used first)
+#   PEXELS_API_KEY_BACKUP - Backup key (used if primary fails/rate limited)
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+PEXELS_API_KEY_BACKUP = os.environ.get("PEXELS_API_KEY_BACKUP", "")
 UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "")
 
 # Global browser instance
@@ -105,7 +110,100 @@ class SearchResponse(BaseModel):
     error: Optional[str] = None
 
 
-# ============== PEXELS HELPERS ==============
+# ============== PEXELS API ==============
+
+async def call_pexels_api(photo_id: str, api_key: str, key_name: str = "primary") -> Tuple[Optional[dict], bool]:
+    """
+    Call Pexels API with a specific key.
+    
+    Returns: (result_dict, should_try_backup)
+    - result_dict: The metadata if successful, None otherwise
+    - should_try_backup: True if we should try the backup key (rate limit/error)
+    """
+    api_url = f"https://api.pexels.com/v1/photos/{photo_id}"
+    headers = {
+        "Authorization": api_key,
+        "User-Agent": "Echora Image Attribution Service"
+    }
+    
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(api_url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.info(f"Pexels API success ({key_name} key) for photo {photo_id}")
+                    
+                    result = {
+                        "title": data.get("alt") or f"Photo by {data.get('photographer', 'Unknown')}",
+                        "creator": data.get("photographer"),
+                        "creator_url": data.get("photographer_url"),
+                        "description": data.get("alt"),
+                        "keywords": [],
+                        "location": None,
+                        "license": "Pexels License",
+                        "date_created": None,
+                        "copyright": f"© {data.get('photographer')}" if data.get('photographer') else None,
+                        "source_url": data.get("url"),
+                        "scrape_status": "success"
+                    }
+                    
+                    logger.info(f"Pexels API returned: creator={result['creator']}, title={result['title']}")
+                    return result, False
+                    
+                elif resp.status == 429:
+                    # Rate limited - try backup
+                    logger.warning(f"Pexels API rate limited ({key_name} key)")
+                    return None, True
+                    
+                elif resp.status == 404:
+                    logger.warning(f"Pexels photo {photo_id} not found")
+                    return None, False  # Don't retry - photo doesn't exist
+                    
+                elif resp.status == 401:
+                    logger.error(f"Pexels API unauthorized ({key_name} key) - invalid API key")
+                    return None, True  # Try backup in case primary is bad
+                    
+                else:
+                    logger.warning(f"Pexels API returned status {resp.status} ({key_name} key)")
+                    return None, True
+                    
+    except asyncio.TimeoutError:
+        logger.error(f"Pexels API timeout ({key_name} key)")
+        return None, True
+    except Exception as e:
+        logger.error(f"Pexels API error ({key_name} key): {e}")
+        return None, True
+
+
+async def fetch_pexels_via_api(photo_id: str) -> Optional[dict]:
+    """
+    Fetch photo metadata from Pexels API.
+    Tries primary key first, falls back to backup if needed.
+    """
+    # Check if we have any API keys
+    if not PEXELS_API_KEY and not PEXELS_API_KEY_BACKUP:
+        logger.info("No Pexels API keys configured (set PEXELS_API_KEY and/or PEXELS_API_KEY_BACKUP)")
+        return None
+    
+    # Try primary key first
+    if PEXELS_API_KEY:
+        result, should_try_backup = await call_pexels_api(photo_id, PEXELS_API_KEY, "primary")
+        if result:
+            return result
+        if not should_try_backup:
+            return None  # Photo doesn't exist, no point trying backup
+    else:
+        should_try_backup = True
+    
+    # Try backup key if needed
+    if should_try_backup and PEXELS_API_KEY_BACKUP:
+        logger.info("Trying backup Pexels API key...")
+        result, _ = await call_pexels_api(photo_id, PEXELS_API_KEY_BACKUP, "backup")
+        if result:
+            return result
+    
+    return None
+
 
 def extract_pexels_info_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
     """Extract photo ID and title from Pexels URL patterns.
@@ -146,53 +244,6 @@ def extract_pexels_info_from_url(url: str) -> Tuple[Optional[str], Optional[str]
             logger.info(f"Extracted title from page URL: {title}")
     
     return photo_id, title
-
-
-async def fetch_pexels_via_api(photo_id: str) -> Optional[dict]:
-    """Fetch photo metadata from Pexels API."""
-    if not PEXELS_API_KEY:
-        logger.info("No PEXELS_API_KEY set, skipping API lookup")
-        return None
-    
-    api_url = f"https://api.pexels.com/v1/photos/{photo_id}"
-    headers = {
-        "Authorization": PEXELS_API_KEY,
-        "User-Agent": "Echora Image Attribution Service"
-    }
-    
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(api_url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    logger.info(f"Pexels API success for photo {photo_id}")
-                    
-                    result = {
-                        "title": data.get("alt") or f"Photo by {data.get('photographer', 'Unknown')}",
-                        "creator": data.get("photographer"),
-                        "creator_url": data.get("photographer_url"),
-                        "description": data.get("alt"),
-                        "keywords": [],
-                        "location": None,
-                        "license": "Pexels License",
-                        "date_created": None,
-                        "copyright": f"© {data.get('photographer')}" if data.get('photographer') else None,
-                        "source_url": data.get("url"),
-                        "scrape_status": "success"
-                    }
-                    
-                    logger.info(f"Pexels API returned: creator={result['creator']}, title={result['title']}")
-                    return result
-                    
-                elif resp.status == 404:
-                    logger.warning(f"Pexels photo {photo_id} not found via API")
-                else:
-                    logger.warning(f"Pexels API returned status {resp.status}")
-                    
-    except Exception as e:
-        logger.error(f"Pexels API error: {e}")
-    
-    return None
 
 
 def extract_pexels_metadata_from_urls(urls: List[str]) -> dict:
@@ -299,13 +350,13 @@ async def scrape_with_playwright(url: str, all_matched_urls: List[str] = None, t
     if "pexels.com" in url.lower():
         photo_id, url_title = extract_pexels_info_from_url(url)
         if photo_id:
-            # Try API first
+            # Try API first (with automatic fallback to backup key)
             api_result = await fetch_pexels_via_api(photo_id)
             if api_result:
                 return api_result
             
-            # No API key - extract what we can from URLs
-            logger.info("No Pexels API key, extracting metadata from URLs")
+            # No API key or API failed - extract what we can from URLs
+            logger.info("Pexels API unavailable, extracting metadata from URLs")
             
             # Use all matched URLs to find metadata
             urls_to_check = [url] + (all_matched_urls or [])
@@ -549,11 +600,18 @@ def deduplicate_urls(urls: List[str]) -> List[str]:
 
 @app.get("/")
 async def root():
+    pexels_status = []
+    if PEXELS_API_KEY:
+        pexels_status.append("primary")
+    if PEXELS_API_KEY_BACKUP:
+        pexels_status.append("backup")
+    
     return {
         "status": "healthy", 
         "service": "reverse-image-attribution", 
-        "version": "4.6.0", 
-        "pexels_api": "enabled" if PEXELS_API_KEY else "disabled (set PEXELS_API_KEY for photographer names)"
+        "version": "4.7.0", 
+        "pexels_api_keys": pexels_status if pexels_status else ["none configured"],
+        "env_vars_needed": ["PEXELS_API_KEY", "PEXELS_API_KEY_BACKUP"]
     }
 
 @app.get("/health")
@@ -573,8 +631,12 @@ async def debug_scrape(request: DebugRequest):
             "url": url,
             "extracted_photo_id": photo_id,
             "extracted_title": title,
-            "pexels_api_enabled": bool(PEXELS_API_KEY),
-            "note": "Set PEXELS_API_KEY environment variable to get photographer names"
+            "pexels_api_primary": bool(PEXELS_API_KEY),
+            "pexels_api_backup": bool(PEXELS_API_KEY_BACKUP),
+            "env_vars": {
+                "PEXELS_API_KEY": "set" if PEXELS_API_KEY else "NOT SET",
+                "PEXELS_API_KEY_BACKUP": "set" if PEXELS_API_KEY_BACKUP else "NOT SET"
+            }
         }
     
     return {"url": url, "note": "Use /reverse-search for full results"}
@@ -655,7 +717,7 @@ async def reverse_search(request: SearchRequest):
         # Add error message if we couldn't get photographer
         error_msg = None
         if results and not results[0].creator and "pexels" in (results[0].source_domain or ""):
-            error_msg = "Photographer name requires PEXELS_API_KEY environment variable (free at pexels.com/api)"
+            error_msg = "Photographer requires PEXELS_API_KEY and/or PEXELS_API_KEY_BACKUP environment variables"
         
         return SearchResponse(
             found=len(results) > 0,
