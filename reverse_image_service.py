@@ -1,4 +1,4 @@
-"""Reverse Image Attribution Service with Playwright"""
+"""Reverse Image Attribution Service with Playwright v4.1.0"""
 
 import asyncio
 import logging
@@ -22,7 +22,7 @@ from playwright.async_api import async_playwright, Browser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="4.0.0")
+app = FastAPI(title="Reverse Image Attribution API", version="4.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Global browser instance
@@ -42,9 +42,10 @@ async def get_browser() -> Browser:
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
             ]
         )
-        logger.info("Browser launched")
+        logger.info("Browser launched successfully")
     return _browser
 
 
@@ -138,12 +139,12 @@ PRIORITY_DOMAINS = [
 
 # ============== PLAYWRIGHT SCRAPER ==============
 
-async def scrape_with_playwright(url: str, timeout: int = 20) -> dict:
+async def scrape_with_playwright(url: str, timeout: int = 25) -> dict:
     """Scrape a page using Playwright (bypasses Cloudflare)."""
     page_url = transform_url_to_page(url)
     domain = urlparse(page_url).netloc.lower()
     
-    # Determine license
+    # Determine license based on domain
     license_info = None
     if "pexels.com" in domain:
         license_info = "Pexels License"
@@ -170,96 +171,185 @@ async def scrape_with_playwright(url: str, timeout: int = 20) -> dict:
         "scrape_status": "pending"
     }
     
+    page = None
     try:
         browser = await get_browser()
-        page = await browser.new_page(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            java_script_enabled=True,
         )
+        page = await context.new_page()
         
         logger.info(f"Playwright: navigating to {page_url}")
         
-        await page.goto(page_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        # Navigate and wait for network to be mostly idle
+        response = await page.goto(page_url, wait_until="networkidle", timeout=timeout * 1000)
         
-        # Wait a bit for JS to execute
-        await asyncio.sleep(1)
+        if response:
+            logger.info(f"Response status: {response.status}")
+            if response.status >= 400:
+                result["scrape_status"] = "failed"
+                await context.close()
+                return result
         
+        # Extra wait for JavaScript rendering
+        await asyncio.sleep(2)
+        
+        # ===== PEXELS SPECIFIC =====
+        if "pexels.com" in domain:
+            logger.info("Pexels detected - using specific selectors")
+            
+            # Try to find photographer by various methods
+            try:
+                # Method 1: Look for photographer link with /@username pattern
+                photographer_links = await page.query_selector_all('a[href*="/@"]')
+                for link in photographer_links:
+                    href = await link.get_attribute("href")
+                    text = await link.inner_text()
+                    text = text.strip() if text else ""
+                    if text and len(text) < 100 and "/@" in (href or ""):
+                        # Skip navigation/menu links
+                        if text.lower() not in ["login", "join", "home", "explore", ""]:
+                            result["creator"] = text
+                            if href:
+                                result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
+                            logger.info(f"Found creator via /@link: {text}")
+                            break
+                
+                # Method 2: Look for photographer in h1 or title area
+                if not result["creator"]:
+                    h1 = await page.query_selector('h1')
+                    if h1:
+                        h1_text = await h1.inner_text()
+                        if h1_text:
+                            result["title"] = h1_text.strip()
+                
+                # Method 3: Check for "Photo by" text
+                if not result["creator"]:
+                    page_text = await page.content()
+                    photo_by_match = re.search(r'Photo\s+by\s+([^<>"\n]+)', page_text, re.IGNORECASE)
+                    if photo_by_match:
+                        creator = photo_by_match.group(1).strip()
+                        if len(creator) < 100:
+                            result["creator"] = creator
+                            logger.info(f"Found creator via 'Photo by': {creator}")
+                
+                # Method 4: Look for location text
+                location_match = re.search(r'Location:\s*([^<>"\n]+)', await page.content(), re.IGNORECASE)
+                if location_match:
+                    result["location"] = location_match.group(1).strip()
+                
+            except Exception as e:
+                logger.warning(f"Pexels-specific extraction error: {e}")
+        
+        # Get full page HTML for further parsing
         html = await page.content()
-        await page.close()
+        await context.close()
         
         if not html or len(html) < 500:
+            logger.warning(f"Page HTML too short: {len(html) if html else 0} bytes")
+            result["scrape_status"] = "failed"
+            return result
+        
+        # Check for Cloudflare challenge
+        if "Just a moment" in html or "Checking your browser" in html:
+            logger.warning("Cloudflare challenge detected")
             result["scrape_status"] = "failed"
             return result
         
         soup = BeautifulSoup(html, "html.parser")
         
-        # ===== JSON-LD =====
+        # ===== JSON-LD EXTRACTION =====
         for script in soup.find_all("script", {"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string) if script.string else {}
                 if isinstance(data, list):
                     data = data[0] if data else {}
-                if data.get("@type") in ["ImageObject", "Photograph", "CreativeWork"]:
-                    author = data.get("author") or data.get("creator")
-                    if isinstance(author, dict):
-                        result["creator"] = author.get("name")
-                        result["creator_url"] = author.get("url")
-                    elif isinstance(author, str):
-                        result["creator"] = author
-                    result["title"] = data.get("name")
-                    result["description"] = data.get("description")
-                    date = data.get("dateCreated") or data.get("uploadDate")
-                    if date:
-                        result["date_created"] = date[:10]
-                    loc = data.get("contentLocation")
-                    if isinstance(loc, dict):
-                        result["location"] = loc.get("name")
-                    elif isinstance(loc, str):
-                        result["location"] = loc
-                    kw = data.get("keywords")
-                    if isinstance(kw, list):
-                        result["keywords"] = kw[:20]
-                    elif isinstance(kw, str):
-                        result["keywords"] = [k.strip() for k in kw.split(",")][:20]
-                    logger.info(f"JSON-LD: creator={result['creator']}")
+                
+                obj_type = data.get("@type", "")
+                if obj_type in ["ImageObject", "Photograph", "CreativeWork", "MediaObject"]:
+                    logger.info(f"Found JSON-LD type: {obj_type}")
+                    
+                    # Author/Creator
+                    if not result["creator"]:
+                        author = data.get("author") or data.get("creator")
+                        if isinstance(author, dict):
+                            result["creator"] = author.get("name")
+                            result["creator_url"] = author.get("url")
+                        elif isinstance(author, str):
+                            result["creator"] = author
+                    
+                    # Title
+                    if not result["title"]:
+                        result["title"] = data.get("name") or data.get("headline")
+                    
+                    # Description
+                    if not result["description"]:
+                        result["description"] = data.get("description")
+                    
+                    # Date
+                    if not result["date_created"]:
+                        date = data.get("dateCreated") or data.get("uploadDate") or data.get("datePublished")
+                        if date:
+                            result["date_created"] = date[:10]
+                    
+                    # Location
+                    if not result["location"]:
+                        loc = data.get("contentLocation") or data.get("locationCreated")
+                        if isinstance(loc, dict):
+                            result["location"] = loc.get("name") or loc.get("address")
+                        elif isinstance(loc, str):
+                            result["location"] = loc
+                    
+                    # Keywords
+                    if not result["keywords"]:
+                        kw = data.get("keywords")
+                        if isinstance(kw, list):
+                            result["keywords"] = kw[:20]
+                        elif isinstance(kw, str):
+                            result["keywords"] = [k.strip() for k in kw.split(",")][:20]
+                    
+                    logger.info(f"JSON-LD extracted: creator={result['creator']}")
                     break
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"JSON-LD parse error: {e}")
         
-        # ===== Pexels specific =====
-        if "pexels.com" in domain and not result["creator"]:
-            for link in soup.find_all("a", href=re.compile(r'/@[a-zA-Z0-9_-]+')):
-                text = link.get_text().strip()
-                if text and len(text) < 100 and not text.startswith("http"):
-                    result["creator"] = text
-                    href = link.get("href", "")
-                    result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
-                    logger.info(f"Pexels link: found creator={text}")
-                    break
-        
-        # ===== Meta tags fallback =====
+        # ===== META TAGS FALLBACK =====
         if not result["title"]:
-            og = soup.find("meta", {"property": "og:title"})
-            if og:
-                title = og.get("content", "").strip()
-                title = re.sub(r'\s*[\u00b7|\-]\s*(Pexels|Unsplash|Pixabay|Free).*$', '', title, flags=re.IGNORECASE)
+            og_title = soup.find("meta", {"property": "og:title"})
+            if og_title:
+                title = og_title.get("content", "").strip()
+                # Clean up "Photo by X on Pexels" patterns
+                title = re.sub(r'\s*[·|\-–—]\s*(Pexels|Unsplash|Pixabay).*$', '', title, flags=re.IGNORECASE)
                 result["title"] = title
         
         if not result["creator"]:
+            # Check meta author
             author = soup.find("meta", {"name": "author"})
             if author:
                 result["creator"] = author.get("content", "").strip()
+            
+            # Check for "Photo by" in og:title
+            if not result["creator"]:
+                og_title = soup.find("meta", {"property": "og:title"})
+                if og_title:
+                    content = og_title.get("content", "")
+                    match = re.search(r'Photo\s+by\s+([^·|\-–—]+)', content, re.IGNORECASE)
+                    if match:
+                        result["creator"] = match.group(1).strip()
         
         if not result["description"]:
             desc = soup.find("meta", {"property": "og:description"}) or soup.find("meta", {"name": "description"})
             if desc:
                 result["description"] = desc.get("content", "").strip()[:500]
         
-        # Build copyright
+        # ===== COPYRIGHT =====
         if result["creator"]:
             year = result["date_created"][:4] if result["date_created"] else None
-            result["copyright"] = f"\u00a9 {year} {result['creator']}" if year else f"\u00a9 {result['creator']}"
+            result["copyright"] = f"© {year} {result['creator']}" if year else f"© {result['creator']}"
         
-        # Status
+        # ===== STATUS =====
         if result["creator"] and result["title"]:
             result["scrape_status"] = "success"
         elif result["creator"] or result["title"]:
@@ -267,12 +357,17 @@ async def scrape_with_playwright(url: str, timeout: int = 20) -> dict:
         else:
             result["scrape_status"] = "failed"
         
-        logger.info(f"Scrape complete: status={result['scrape_status']}, creator={result['creator']}")
+        logger.info(f"Scrape complete: status={result['scrape_status']}, creator={result['creator']}, title={result['title']}")
         return result
         
     except Exception as e:
         logger.error(f"Playwright error for {page_url}: {e}")
         result["scrape_status"] = "failed"
+        if page:
+            try:
+                await page.context.close()
+            except:
+                pass
         return result
 
 
@@ -384,7 +479,7 @@ def deduplicate_urls(urls: List[str]) -> List[str]:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.0.0", "browser": "playwright"}
+    return {"status": "healthy", "service": "reverse-image-attribution", "version": "4.1.0", "browser": "playwright"}
 
 @app.get("/health")
 async def health():
