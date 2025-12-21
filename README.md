@@ -1,150 +1,183 @@
-# Reverse Image Attribution Service
+# Reverse Image Metadata Service
 
-A TinEye-like reverse image search service for finding image sources and metadata at scale.
+Fast, scalable reverse image attribution service that extracts photographer credits and metadata from images.
 
 ## Features
 
-- **Multiple search engines**: Google Lens, Yandex, Bing Visual Search
-- **File upload support**: Search by uploading images directly
-- **URL-based search**: Search using image URLs
-- **Batch processing**: Process multiple images in one request
-- **Standardized metadata**: Returns consistent metadata format across all sources
-- **Confidence scoring**: Ranks results by reliability
+### ✅ **IPTC Metadata Extraction (FAST - First Priority)**
+- **Checks embedded IPTC/EXIF metadata FIRST** (< 1 second)
+- Extracts: Creator, Copyright, Title, Description, Keywords, Date, Location
+- **If metadata found → Returns immediately** (no reverse search needed)
+- Works with professional stock photos that have embedded credits
 
-## Response Format
+### ✅ **Reverse Image Search (Fallback)**
+Only runs if IPTC metadata is missing or incomplete:
+- Multi-engine support: Google Lens, Yandex, Bing
+- Finds where image appears online
+- Scrapes photographer credits from web pages
 
-Each result returns metadata in this standardized format:
+### ✅ **Smart Scraping**
+- Prioritizes known stock sites (Getty, Shutterstock, Unsplash, Pexels, Pixabay, Flickr)
+- Extracts structured metadata from each source
+- Confidence scoring
 
-```json
-{
-  "type": "image",
-  "id": "img_a1b2c3d4",
-  "title": "Sunset at Malibu",
-  "filename": "sunset_malibu.jpg",
-  "creator": "Jane Doe",
-  "creator_url": "https://unsplash.com/@janedoe",
-  "date_created": "2024-08-15",
-  "description": "A beautiful sunset over the Pacific Ocean at Malibu Beach",
-  "keywords": ["sunset", "beach", "malibu", "ocean", "california"],
-  "location": "Malibu, California",
-  "copyright": "© 2024 Jane Doe",
-  "license": "Unsplash License",
-  "source_url": "https://unsplash.com/photos/abc123",
-  "source_domain": "unsplash",
-  "confidence": 0.85
-}
+### ✅ **Multiple Input Methods**
+- URL-based search
+- File upload
+- Batch processing
+
+## How It Works
+
 ```
-
-All fields are nullable except `type` (always "image") and `keywords` (empty array if none).
-
-## Quick Start
-
-```bash
-# Install dependencies
-pip install fastapi uvicorn aiohttp beautifulsoup4 pydantic
-
-# Run the server
-python reverse_image_service.py
-
-# Test it
-curl -X POST http://localhost:8080/reverse-search \
-  -H "Content-Type: application/json" \
-  -d '{"image_url": "https://images.unsplash.com/photo-1506905925346-21bda4d32df4"}'
+1. Image URL/File received
+   ↓
+2. Check embedded IPTC/EXIF metadata (< 1s)
+   ├─ Creator found? → Return immediately ✅
+   └─ No metadata → Continue to step 3
+   ↓
+3. Reverse Image Search (Google/Yandex/Bing)
+   ↓
+4. Scrape top results for photographer credits
+   ↓
+5. Return structured metadata
 ```
 
 ## API Endpoints
 
 ### `POST /reverse-search`
-Search using an image URL.
+Reverse search by image URL
 
+**Request:**
 ```json
 {
-  "image_url": "https://example.com/image.jpg",
-  "max_results": 10,
+  "image_url": "https://example.com/photo.jpg",
+  "max_results": 5,
   "timeout": 30,
   "engines": ["google", "yandex", "bing"]
 }
 ```
 
+**Response:**
+```json
+{
+  "found": true,
+  "image_url": "https://example.com/photo.jpg",
+  "results": [
+    {
+      "type": "image",
+      "id": "img_abc123_iptc",
+      "creator": "John Doe",
+      "copyright": "© 2024 John Doe",
+      "title": "Sunset Over Mountains",
+      "description": "Beautiful sunset...",
+      "keywords": ["sunset", "mountains", "nature"],
+      "date_created": "2024-03-15",
+      "location": "Colorado, USA",
+      "license": "Creative Commons BY 4.0",
+      "source_url": "https://example.com/photo.jpg",
+      "source_domain": "iptc_embedded",
+      "confidence": 1.0
+    }
+  ],
+  "search_engines_used": ["iptc_embedded"],
+  "total_matches_found": 1
+}
+```
+
 ### `POST /reverse-search/upload`
-Search by uploading an image file (multipart form data).
+Reverse search by uploading a file
+
+**Form Data:**
+- `file`: Image file (max 10MB)
+- `max_results`: Number of results (default: 10)
+- `timeout`: Timeout in seconds (default: 30)
+- `engines`: Comma-separated list (default: "google,yandex,bing")
 
 ### `POST /reverse-search/batch`
-Process multiple images at once (max 50).
+Batch process multiple images (max 50)
 
----
+## Installation
 
-## Important Limitations & Considerations
+```bash
+pip install -r requirements.txt
+```
 
-### 1. Search Engine Scraping is Fragile
+**Dependencies:**
+- `fastapi` - API framework
+- `aiohttp` - Async HTTP client
+- `beautifulsoup4` - HTML parsing
+- `Pillow` - Image processing
+- `iptcinfo3` - IPTC metadata extraction
 
-The search engines (Google, Yandex, Bing) don't have official reverse image search APIs. This service scrapes their HTML responses, which means:
+## Running Locally
 
-- **They can break at any time** when the search engine updates their HTML structure
-- **Rate limiting** - you'll get blocked if you search too frequently
-- **CAPTCHAs** - heavy usage will trigger bot detection
-- **Legal gray area** - check ToS for each service
+```bash
+python reverse_image_service.py
+```
 
-### 2. Google Lens Challenges
+Service runs on `http://localhost:8080`
 
-Google Lens is particularly tricky:
-- No official API
-- Heavy JavaScript rendering (the simple HTTP approach may not work reliably)
-- For production, consider using Playwright/Selenium for browser automation
+## Deployment
 
-### 3. Alternatives to Consider
+### Google Cloud Run
+```bash
+gcloud run deploy reverse-image-metadata \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated
+```
 
-| Service | Pros | Cons |
-|---------|------|------|
-| **TinEye API** | Official API, reliable | $200/mo for 5000 searches |
-| **Google Cloud Vision** | Official, includes labels | Doesn't find source URLs |
-| **SerpAPI** | Reliable scraping | $50/mo+ |
-| **Bing Visual Search API** | Official Microsoft API | Limited free tier |
+## Performance
 
----
+| Scenario | Time |
+|----------|------|
+| IPTC metadata found | < 1 second |
+| Reverse search (no IPTC) | 5-15 seconds |
+| Batch (10 images with IPTC) | < 10 seconds |
+| Batch (10 images, reverse search) | 60-120 seconds |
 
-## Scaling for Production
+## Supported Image Formats
 
-### Level 1: Basic (100s of searches/day)
+- JPEG/JPG (best for IPTC)
+- PNG
+- WebP
+- GIF
+- TIFF
 
-What you have now. Add:
-- Redis caching for repeat searches
-- Rate limiting per IP
-- Basic retry logic
+## Limitations
 
-### Level 2: Medium (1000s of searches/day)
+- **IPTC**: Only works if photographer embedded metadata in the file
+- **Reverse Search**: Subject to rate limits from search engines
+- **Scraping**: May break if stock sites change their HTML structure
+- **Upload**: 10MB file size limit
 
-- **Proxy rotation** - Essential to avoid IP blocks
-- **Queue-based processing** - Redis Queue or Celery
-- **Multiple workers** - Horizontal scaling
+## Tips for Best Results
 
-### Level 3: High Scale (10,000s+ searches/day)
+1. **Professional photos** from Getty, Shutterstock, etc. usually have IPTC metadata
+2. **Social media images** (Instagram, Facebook) typically strip metadata
+3. **Stock photos** are more likely to return results than personal photos
+4. **Higher resolution** images get better reverse search results
 
-At this scale, scraping becomes expensive and unreliable. Consider:
+## API Response Fields
 
-1. **Hybrid approach**: Use official APIs where available + scraping for gaps
-2. **Build your own index**: 
-   - Crawl and index stock photo sites directly
-   - Use perceptual hashing (pHash, dHash) for matching
-   - Store in a vector database like Milvus or Pinecone
+| Field | Description |
+|-------|-------------|
+| `creator` | Photographer/creator name |
+| `creator_url` | Link to creator's profile |
+| `copyright` | Copyright notice |
+| `title` | Image title |
+| `description` | Image description/caption |
+| `keywords` | Tags/keywords |
+| `date_created` | When photo was taken/created |
+| `location` | Where photo was taken |
+| `license` | Usage license |
+| `source_url` | Where we found the info |
+| `source_domain` | Site name (e.g. "iptc_embedded", "unsplash", "pexels") |
+| `confidence` | 0.0-1.0 score (1.0 = IPTC embedded) |
 
----
+## Version
 
-## Cost Comparison
-
-| Approach | Monthly Cost @ 10k searches | Reliability |
-|----------|----------------------------|-------------|
-| TinEye API | ~$400 | ★★★★★ |
-| SerpAPI | ~$100 | ★★★★☆ |
-| This service (self-hosted) | $50-100 (proxies) | ★★★☆☆ |
-| Build your own index | $200+ (infra) | ★★★★☆ |
-
----
-
-## Files
-
-- `reverse_image_service.py` - Main FastAPI service
-- `example_client.py` - Example usage
+**v2.1.0** - IPTC-first extraction strategy
 
 ## License
 
