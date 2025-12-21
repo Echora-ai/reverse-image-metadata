@@ -10,7 +10,7 @@ import base64
 import tempfile
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import quote_plus, urlencode, urlparse, parse_qs
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -24,7 +24,7 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="2.2.0")
+app = FastAPI(title="Reverse Image Attribution API", version="2.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ============== MODELS ==============
@@ -61,6 +61,145 @@ class SearchResponse(BaseModel):
     search_engines_used: list[str]
     total_matches_found: int = 0
     error: Optional[str] = None
+
+
+# ============== URL TRANSFORMERS ==============
+# Convert CDN/image URLs to their corresponding page URLs
+
+def transform_url_to_page(url: str) -> Tuple[str, bool]:
+    """
+    Transform a CDN/image URL to the actual page URL where metadata lives.
+    Returns (transformed_url, was_transformed).
+    """
+    url_lower = url.lower()
+    
+    # PEXELS: images.pexels.com/photos/ID/... -> www.pexels.com/photo/ID/
+    if "images.pexels.com" in url_lower:
+        match = re.search(r'/photos/(\d+)/', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://www.pexels.com/photo/{photo_id}/", True
+    
+    # UNSPLASH: images.unsplash.com/photo-ID... -> unsplash.com/photos/ID
+    if "images.unsplash.com" in url_lower:
+        # Unsplash URLs look like: images.unsplash.com/photo-1234567890abcdef...
+        match = re.search(r'/photo-([a-zA-Z0-9_-]+)', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://unsplash.com/photos/{photo_id}", True
+    
+    # PIXABAY: cdn.pixabay.com/photo/... or pixabay.com/get/... -> pixabay.com/photos/id-ID/
+    if "cdn.pixabay.com" in url_lower or "pixabay.com/get/" in url_lower:
+        # Try to extract ID from various Pixabay CDN formats
+        match = re.search(r'/(\d{6,})', url)  # Look for 6+ digit ID
+        if match:
+            photo_id = match.group(1)
+            return f"https://pixabay.com/photos/id-{photo_id}/", True
+    
+    # FLICKR: live.staticflickr.com/... or farm*.staticflickr.com/...
+    if "staticflickr.com" in url_lower or "static.flickr.com" in url_lower:
+        # Flickr URLs: /server/photoid_secret.jpg
+        match = re.search(r'/\d+/(\d+)_[a-f0-9]+', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://www.flickr.com/photos/search/?photo_id={photo_id}", True
+    
+    # SHUTTERSTOCK: image.shutterstock.com/... 
+    if "image.shutterstock.com" in url_lower or "shutterstock.com/shutterstock/" in url_lower:
+        match = re.search(r'[-_](\d{8,})', url)  # 8+ digit ID
+        if match:
+            photo_id = match.group(1)
+            return f"https://www.shutterstock.com/image-photo/{photo_id}", True
+    
+    # GETTY: media.gettyimages.com/...
+    if "media.gettyimages.com" in url_lower:
+        match = re.search(r'/(\d{8,})', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://www.gettyimages.com/detail/{photo_id}", True
+    
+    # ADOBE STOCK: t3.ftcdn.net/... or as1.ftcdn.net/...
+    if "ftcdn.net" in url_lower:
+        match = re.search(r'[-_](\d{8,})', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://stock.adobe.com/images/x/{photo_id}", True
+    
+    # DEPOSITPHOTOS: st.depositphotos.com/... or static*.depositphotos.com/...
+    if "depositphotos.com" in url_lower and ("st." in url_lower or "static" in url_lower):
+        match = re.search(r'[-_](\d{6,})', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://depositphotos.com/{photo_id}/stock-photo.html", True
+    
+    # iSTOCK: media.istockphoto.com/...
+    if "istockphoto.com" in url_lower and "media." in url_lower:
+        match = re.search(r'/(\d{8,})', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://www.istockphoto.com/photo/gm{photo_id}", True
+    
+    # DREAMSTIME: thumbs.dreamstime.com/... or dt.dreamstime.com/...
+    if "dreamstime.com" in url_lower and ("thumbs." in url_lower or "dt." in url_lower):
+        match = re.search(r'[-_](\d{6,})', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://www.dreamstime.com/stock-photo-image{photo_id}", True
+    
+    # 500px: drscdn.500px.org/...
+    if "500px.org" in url_lower:
+        match = re.search(r'/photo/(\d+)/', url)
+        if match:
+            photo_id = match.group(1)
+            return f"https://500px.com/photo/{photo_id}", True
+    
+    # Not a known CDN URL, return as-is
+    return url, False
+
+
+def deduplicate_urls(urls: list[str]) -> list[str]:
+    """
+    Deduplicate URLs, preferring page URLs over CDN URLs.
+    Also groups by photo ID to avoid scraping the same image multiple times.
+    """
+    seen_ids = set()
+    result = []
+    
+    for url in urls:
+        # Transform to page URL if possible
+        page_url, was_transformed = transform_url_to_page(url)
+        
+        # Extract a unique identifier (photo ID) from the URL
+        photo_id = None
+        
+        # Try to extract Pexels ID
+        match = re.search(r'pexels.*?(\d{7,})', url)
+        if match:
+            photo_id = f"pexels_{match.group(1)}"
+        
+        # Try to extract Unsplash ID
+        if not photo_id:
+            match = re.search(r'unsplash.*?photo[/-]([a-zA-Z0-9_-]{10,})', url)
+            if match:
+                photo_id = f"unsplash_{match.group(1)}"
+        
+        # Try to extract generic numeric ID
+        if not photo_id:
+            match = re.search(r'/(\d{6,})', url)
+            if match:
+                domain = urlparse(url).netloc.replace("www.", "").split(".")[0]
+                photo_id = f"{domain}_{match.group(1)}"
+        
+        # Fallback to page URL as ID
+        if not photo_id:
+            photo_id = page_url
+        
+        if photo_id not in seen_ids:
+            seen_ids.add(photo_id)
+            result.append(page_url)  # Always use the page URL
+    
+    return result
+
 
 # ============== SCRAPERS ==============
 
@@ -104,7 +243,6 @@ class BaseScraper(ABC):
             path = urlparse(url).path
             filename = path.split("/")[-1]
             if "." in filename and len(filename) < 200:
-                # Remove query params from filename
                 filename = filename.split("?")[0]
                 return filename
         except:
@@ -125,22 +263,35 @@ class BaseScraper(ABC):
             }
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
                 async with session.get(url, headers=headers, allow_redirects=True) as response:
+                    content_type = response.headers.get("Content-Type", "")
+                    
+                    # Check if we got an image instead of HTML
+                    if content_type.startswith("image/"):
+                        logger.warning(f"Got image binary instead of HTML for {url}")
+                        result["scrape_status"] = "failed"
+                        return result
+                    
                     if response.status != 200:
                         logger.warning(f"HTTP {response.status} for {url}")
                         result["scrape_status"] = "failed"
-                        return result  # Still return with URL info
+                        return result
+                    
                     html = await response.text()
+                    
+                    # Quick sanity check - does this look like HTML?
+                    if not html.strip().startswith("<!") and "<html" not in html[:500].lower():
+                        logger.warning(f"Response doesn't look like HTML for {url}")
+                        result["scrape_status"] = "failed"
+                        return result
             
             soup = BeautifulSoup(html, "html.parser")
             extracted = await self._extract_metadata(soup, url)
             
             if extracted:
-                # Merge extracted data into result
                 for key, value in extracted.items():
                     if value is not None and value != [] and value != "":
                         result[key] = value
                 
-                # Check how much we got
                 important_fields = ["creator", "title", "description", "license"]
                 found_count = sum(1 for f in important_fields if result.get(f))
                 result["scrape_status"] = "success" if found_count >= 2 else "partial"
@@ -167,8 +318,7 @@ class BaseScraper(ABC):
         for prefix in ["Photo by ", "By ", "Credit: ", "Image by ", "© ", "Photography by ", "Photograph by "]:
             if cleaned.startswith(prefix):
                 cleaned = cleaned[len(prefix):]
-        # Remove trailing site names
-        for suffix in [" - Pexels", " | Pexels", " - Unsplash", " | Unsplash", " - Pixabay", " | Getty Images", " - Shutterstock"]:
+        for suffix in [" - Pexels", " | Pexels", " - Unsplash", " | Unsplash", " - Pixabay", " | Getty Images", " - Shutterstock", " · Pexels"]:
             if cleaned.endswith(suffix):
                 cleaned = cleaned[:-len(suffix)]
         return cleaned.strip() if cleaned else None
@@ -177,13 +327,11 @@ class BaseScraper(ABC):
         """Extract keywords from meta tags."""
         keywords = []
         
-        # Try meta keywords
         meta_kw = soup.find("meta", {"name": "keywords"})
         if meta_kw:
             content = meta_kw.get("content", "")
             keywords.extend([k.strip() for k in content.split(",") if k.strip()])
         
-        # Try article:tag
         for tag in soup.find_all("meta", {"property": "article:tag"}):
             kw = tag.get("content", "").strip()
             if kw and kw not in keywords:
@@ -223,19 +371,16 @@ class BaseScraper(ABC):
     
     def _extract_title(self, soup: BeautifulSoup) -> Optional[str]:
         """Extract title from various sources."""
-        # Try og:title first
         og = soup.find("meta", {"property": "og:title"})
         if og:
             title = og.get("content", "").strip()
             if title:
                 return self._clean_text(title)
         
-        # Try regular title
         title_tag = soup.find("title")
         if title_tag:
             return self._clean_text(title_tag.get_text())
         
-        # Try h1
         h1 = soup.find("h1")
         if h1:
             return self._clean_text(h1.get_text())
@@ -258,7 +403,6 @@ class UnsplashScraper(BaseScraper):
         result = {}
         result["license"] = "Unsplash License"
         
-        # JSON-LD
         for script in soup.find_all("script", {"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string) if script.string else {}
@@ -287,7 +431,6 @@ class UnsplashScraper(BaseScraper):
             except:
                 pass
         
-        # Fallback: meta tags
         if not result.get("creator"):
             meta = soup.find("meta", {"name": "twitter:creator"})
             if meta:
@@ -315,6 +458,7 @@ class PexelsScraper(BaseScraper):
         result = {}
         result["license"] = "Pexels License"
         
+        # Try JSON-LD first
         for script in soup.find_all("script", {"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string) if script.string else {}
@@ -343,12 +487,37 @@ class PexelsScraper(BaseScraper):
             except:
                 pass
         
+        # Fallback: Look for photographer link
         if not result.get("creator"):
-            link = soup.find("a", href=re.compile(r"/@[a-zA-Z0-9_-]+"))
-            if link:
-                result["creator"] = self._clean_text(link.get_text())
+            # Pexels uses links like /@username or /photographer/name
+            for link in soup.find_all("a", href=True):
                 href = link.get("href", "")
-                result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
+                if "/@" in href or "/photographer/" in href:
+                    text = link.get_text().strip()
+                    if text and len(text) < 50 and not text.startswith("http"):
+                        result["creator"] = self._clean_text(text)
+                        if href.startswith("/"):
+                            result["creator_url"] = f"https://www.pexels.com{href}"
+                        else:
+                            result["creator_url"] = href
+                        break
+        
+        # Try to find photographer in the page structure
+        if not result.get("creator"):
+            # Look for elements that typically contain photographer info
+            for selector in ["[data-testid='photo-page-avatar']", ".photo-page-avatar", ".photographer-name", "[class*='photographer']", "[class*='Photographer']"]:
+                elem = soup.select_one(selector)
+                if elem:
+                    # Try to find an anchor inside or nearby
+                    a_tag = elem.find("a") or elem.find_parent("a")
+                    if a_tag:
+                        text = a_tag.get_text().strip()
+                        if text and len(text) < 50:
+                            result["creator"] = self._clean_text(text)
+                            href = a_tag.get("href", "")
+                            if href.startswith("/"):
+                                result["creator_url"] = f"https://www.pexels.com{href}"
+                            break
         
         if not result.get("title"):
             result["title"] = self._extract_title(soup)
@@ -555,11 +724,9 @@ class GenericScraper(BaseScraper):
             except:
                 pass
         
-        # Fallback: og:title
         if not result.get("title"):
             result["title"] = self._extract_title(soup)
         
-        # Fallback: author meta tags (try many variations)
         if not result.get("creator"):
             author_metas = [
                 ("meta", {"name": "author"}),
@@ -579,7 +746,6 @@ class GenericScraper(BaseScraper):
                         result["creator"] = creator
                         break
         
-        # Try to find photographer in page text
         if not result.get("creator"):
             patterns = [
                 r"[Pp]hoto(?:graph)?(?:y)?\s*(?:by|:)\s*([A-Z][a-zA-Z\s\-\.]+)",
@@ -588,7 +754,7 @@ class GenericScraper(BaseScraper):
                 r"©\s*\d{4}\s*([A-Z][a-zA-Z\s\-\.]+)",
                 r"[Aa]rtist\s*(?::|by)?\s*([A-Z][a-zA-Z\s\-\.]+)",
             ]
-            page_text = soup.get_text()[:5000]  # First 5000 chars
+            page_text = soup.get_text()[:5000]
             for pattern in patterns:
                 match = re.search(pattern, page_text)
                 if match:
@@ -606,7 +772,6 @@ class GenericScraper(BaseScraper):
         if not result.get("date_created"):
             result["date_created"] = self._extract_date(soup)
         
-        # Try to extract copyright from page
         if not result.get("copyright"):
             copyright_patterns = [
                 r"(©\s*\d{4}\s*[^<\n]{3,50})",
@@ -668,7 +833,7 @@ class ReverseImageSearch:
         result = SearchResult()
         
         if engines is None:
-            engines = ["yandex", "bing"]  # Google Lens requires JS, skip by default
+            engines = ["yandex", "bing"]
         
         tasks = []
         if "google" in engines:
@@ -856,7 +1021,7 @@ class ReverseImageSearch:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "2.2.0"}
+    return {"status": "healthy", "service": "reverse-image-attribution", "version": "2.3.0"}
 
 @app.get("/health")
 async def health():
@@ -965,8 +1130,8 @@ async def _perform_search(
             engines=engines
         )
         
-        # Store matched URLs for response
-        matched_urls = search_results.urls.copy()
+        # Store original matched URLs
+        original_matched_urls = search_results.urls.copy()
         
         if not search_results.urls:
             return SearchResponse(
@@ -979,9 +1144,14 @@ async def _perform_search(
                 error="; ".join(search_results.errors) if search_results.errors else "No matches found"
             )
         
+        # ========== STEP 3: Transform CDN URLs to page URLs and deduplicate ==========
+        logger.info(f"Transforming {len(search_results.urls)} URLs...")
+        page_urls = deduplicate_urls(search_results.urls)
+        logger.info(f"After deduplication: {len(page_urls)} unique page URLs")
+        
         # Prioritize known stock photo domains
         prioritized = []
-        for url in search_results.urls:
+        for url in page_urls:
             priority = 0
             for i, domain in enumerate(PRIORITY_DOMAINS):
                 if domain in url.lower():
@@ -991,16 +1161,17 @@ async def _perform_search(
         
         prioritized.sort(key=lambda x: -x[1])
         
-        # Scrape ALL results - don't discard any!
+        # Scrape ALL results
         scrape_limit = min(15, len(prioritized))
         results = []
         
         for url, priority in prioritized[:scrape_limit]:
             scraper = get_scraper_for_url(url)
+            logger.info(f"Scraping {url} with {scraper.source_name} scraper...")
+            
             try:
                 metadata = await scraper.scrape(url)
                 
-                # ALWAYS add the result, even if scraping got minimal data
                 if metadata:
                     # Calculate confidence score
                     score = 0.0
@@ -1012,7 +1183,6 @@ async def _perform_search(
                     score += 0.05 if metadata.get("date_created") else 0
                     score += 0.05 if metadata.get("keywords") else 0
                     
-                    # Minimum score if we at least have the URL
                     if score < 0.1:
                         score = 0.1
                     
@@ -1037,9 +1207,12 @@ async def _perform_search(
                         scrape_status=metadata.get("scrape_status", "partial")
                     ))
                     
+                    # If we found a creator, log it!
+                    if metadata.get("creator"):
+                        logger.info(f"✓ Found creator: {metadata.get('creator')} from {url}")
+                    
             except Exception as e:
                 logger.warning(f"Failed to scrape {url}: {e}")
-                # Still add a minimal result for this URL
                 url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
                 domain = urlparse(url).netloc.replace("www.", "")
                 results.append(ImageMetadata(
@@ -1061,19 +1234,18 @@ async def _perform_search(
                     scrape_status="failed"
                 ))
             
-            # Small delay to be polite
             await asyncio.sleep(0.2)
         
         # Sort by confidence
         results.sort(key=lambda x: x.confidence, reverse=True)
         
         return SearchResponse(
-            found=len(matched_urls) > 0,  # Found = we found matching URLs
+            found=len(original_matched_urls) > 0,
             image_url=image_url or "uploaded_file",
             results=results[:max_results],
-            matched_urls=matched_urls[:20],  # Include raw URLs
+            matched_urls=original_matched_urls[:20],
             search_engines_used=search_results.engines_used,
-            total_matches_found=len(matched_urls)
+            total_matches_found=len(original_matched_urls)
         )
     
     except Exception as e:
