@@ -15,6 +15,7 @@ from urllib.parse import quote_plus, urlencode, urlparse, parse_qs
 from dataclasses import dataclass, field
 from io import BytesIO
 
+from iptc_extractor import extract_iptc_metadata
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
@@ -23,7 +24,7 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="2.0.0")
+app = FastAPI(title="Reverse Image Attribution API", version="2.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ============== MODELS ==============
@@ -48,7 +49,7 @@ class ImageMetadata(BaseModel):
     copyright: Optional[str] = None
     license: Optional[str] = None
     source_url: Optional[str] = None  # where we found it
-    source_domain: Optional[str] = None  # e.g. "unsplash", "pexels"
+    source_domain: Optional[str] = None  # e.g. "unsplash", "pexels", "iptc_embedded"
     confidence: float = 0.0
 
 class SearchResponse(BaseModel):
@@ -780,7 +781,7 @@ class ReverseImageSearch:
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "reverse-image-attribution", "version": "2.0.0"}
+    return {"status": "healthy", "service": "reverse-image-attribution", "version": "2.1.0"}
 
 @app.get("/health")
 async def health():
@@ -839,8 +840,46 @@ async def _perform_search(
     timeout: int = 30,
     engines: list[str] = None
 ) -> SearchResponse:
-    """Core search logic used by both endpoints."""
+    """Core search logic - IPTC extraction first, then reverse search."""
     
+    # ========== STEP 1: Check embedded IPTC/EXIF metadata FIRST (< 1 second) ==========
+    logger.info("Checking embedded IPTC/EXIF metadata...")
+    iptc_meta = await extract_iptc_metadata(image_url=image_url, image_bytes=image_bytes)
+    
+    if iptc_meta and iptc_meta.get('creator'):
+        logger.info(f"✓ IPTC creator found: {iptc_meta['creator']} - skipping reverse search")
+        
+        url_hash = hashlib.md5((image_url or "uploaded").encode()).hexdigest()[:8]
+        
+        result = ImageMetadata(
+            type="image",
+            id=f"img_{url_hash}_iptc",
+            title=iptc_meta.get('title'),
+            filename=None,
+            creator=iptc_meta.get('creator'),
+            creator_url=None,
+            date_created=iptc_meta.get('date_created'),
+            description=iptc_meta.get('description'),
+            keywords=iptc_meta.get('keywords', []),
+            location=iptc_meta.get('location'),
+            copyright=iptc_meta.get('copyright'),
+            license=None,
+            source_url=image_url,
+            source_domain="iptc_embedded",
+            confidence=1.0
+        )
+        
+        return SearchResponse(
+            found=True,
+            image_url=image_url or "uploaded_file",
+            results=[result],
+            search_engines_used=["iptc_embedded"],
+            total_matches_found=1
+        )
+    
+    logger.info("No embedded creator metadata - proceeding to reverse search...")
+    
+    # ========== STEP 2: Reverse search (only if IPTC didn't find creator) ==========
     try:
         search_engine = ReverseImageSearch()
         search_results = await search_engine.search(
