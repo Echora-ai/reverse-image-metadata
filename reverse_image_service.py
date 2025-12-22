@@ -34,7 +34,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="5.0.0")
+app = FastAPI(title="Reverse Image Attribution API", version="5.1.0")
 
 # ============== PEXELS API KEY MANAGEMENT ==============
 # Load API keys from environment
@@ -146,6 +146,68 @@ class SearchResponse(BaseModel):
     total_matches_found: int = 0
     api_key_used: Optional[int] = None  # Which key was used (0 or 1)
     error: Optional[str] = None
+
+
+# ============== RESULT SORTING HELPERS ==============
+
+def count_non_null_fields(result: ImageMetadata) -> int:
+    """
+    Count the number of non-null/non-empty important fields in a result.
+    Higher count = more complete metadata = better result.
+    """
+    count = 0
+    
+    # Check string fields
+    if result.creator and result.creator.strip():
+        count += 3  # Creator is extra important, weight it more
+    if result.title and result.title.strip():
+        count += 2
+    if result.description and result.description.strip():
+        count += 1
+    if result.creator_url and result.creator_url.strip():
+        count += 1
+    if result.date_created and result.date_created.strip():
+        count += 1
+    if result.location and result.location.strip():
+        count += 1
+    if result.copyright and result.copyright.strip():
+        count += 1
+    if result.license and result.license.strip():
+        count += 1
+    if result.source_url and result.source_url.strip():
+        count += 1
+    
+    # Check list fields
+    if result.keywords and len(result.keywords) > 0:
+        count += 1
+    
+    return count
+
+
+def sort_results_by_quality(results: list[ImageMetadata]) -> list[ImageMetadata]:
+    """
+    Sort results with the following priority:
+    1. Results with creator (not null/empty) come first
+    2. Among those, sort by count of non-null fields (most complete first)
+    3. Finally, sort by confidence score
+    
+    This ensures the best, most complete results with creator info are at the top.
+    """
+    def sort_key(result: ImageMetadata) -> tuple:
+        has_creator = bool(result.creator and result.creator.strip())
+        non_null_count = count_non_null_fields(result)
+        confidence = result.confidence
+        
+        # Return tuple: (has_creator DESC, non_null_count DESC, confidence DESC)
+        # We negate values because Python sorts ascending by default
+        return (
+            -int(has_creator),      # True (1) comes before False (0) when negated
+            -non_null_count,        # Higher counts first
+            -confidence             # Higher confidence first
+        )
+    
+    return sorted(results, key=sort_key)
+
 
 # ============== URL TRANSFORMATION ==============
 
@@ -1196,7 +1258,7 @@ class PexelsApiSearch:
     def extract_pexels_id(self, url: str) -> Optional[str]:
         """Extract Pexels photo ID from various URL formats"""
         patterns = [
-            r"pexels\.com/photo/[^/]+-(\d+)",
+            r"pexels\.com/photo/[^/]+\-(\d+)",
             r"pexels\.com/photo/(\d+)",
             r"images\.pexels\.com/photos/(\d+)/",
             r"pexels-photo-(\d+)",
@@ -1226,12 +1288,13 @@ async def root():
     return {
         "status": "healthy", 
         "service": "reverse-image-attribution", 
-        "version": "5.0.0",
+        "version": "5.1.0",
         "cloudscraper_available": HAS_CLOUDSCRAPER,
         "pexels_api_keys": pexels_keys_labels,
         "pexels_key_selection": "explicit via api_key_index parameter (0 or 1)",
         "env_vars_needed": ["PEXELS_API_KEY", "PEXELS_API_KEY_BACKUP"],
-        "usage": "Pass api_key_index=0 for primary key, api_key_index=1 for backup key"
+        "usage": "Pass api_key_index=0 for primary key, api_key_index=1 for backup key",
+        "result_sorting": "Prioritizes results with creator, then by most non-null fields, then by confidence"
     }
 
 @app.get("/health")
@@ -1262,6 +1325,11 @@ async def reverse_search(request: SearchRequest):
     
     Pass api_key_index=0 for primary Pexels key, api_key_index=1 for backup.
     If not specified, defaults to primary key (0).
+    
+    Results are sorted by:
+    1. Has creator (non-null) - results with creator come first
+    2. Count of non-null fields - more complete results come first
+    3. Confidence score - higher confidence comes first
     """
     image_url = str(request.image_url)
     logger.info(f"Reverse search for URL: {image_url}, api_key_index={request.api_key_index}")
@@ -1380,12 +1448,13 @@ async def _perform_search(
             
             await asyncio.sleep(0.2)
         
-        results.sort(key=lambda x: x.confidence, reverse=True)
+        # Sort results by quality: creator first, then non-null count, then confidence
+        sorted_results = sort_results_by_quality(results)
         
         return SearchResponse(
-            found=len(results) > 0,
+            found=len(sorted_results) > 0,
             image_url=image_url or "uploaded_file",
-            results=results[:max_results],
+            results=sorted_results[:max_results],
             matched_urls=raw_matched_urls,
             search_engines_used=search_results.engines_used,
             total_matches_found=len(raw_matched_urls),
