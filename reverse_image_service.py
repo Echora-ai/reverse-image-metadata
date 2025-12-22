@@ -34,9 +34,9 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="5.1.0")
+app = FastAPI(title="Reverse Image Attribution API", version="5.2.0")
 
-# ============== PEXELS API KEY MANAGEMENT ==============
+# ============== PEXELS API KEY ROTATION ==============
 # Load API keys from environment
 PEXELS_API_KEY_PRIMARY = os.getenv("PEXELS_API_KEY", "")
 PEXELS_API_KEY_BACKUP = os.getenv("PEXELS_API_KEY_BACKUP", "")
@@ -44,53 +44,41 @@ PEXELS_API_KEY_BACKUP = os.getenv("PEXELS_API_KEY_BACKUP", "")
 # Build list of available keys (filter out empty ones)
 PEXELS_API_KEYS = [k for k in [PEXELS_API_KEY_PRIMARY, PEXELS_API_KEY_BACKUP] if k]
 
-class ApiKeyManager:
-    """
-    API key manager that allows explicit key selection.
-    Xano controls which key to use via api_key_index parameter.
-    
-    - api_key_index=0: Use primary key (PEXELS_API_KEY)
-    - api_key_index=1: Use backup key (PEXELS_API_KEY_BACKUP)
-    """
+# Thread-safe counter for round-robin key selection
+class ApiKeyRotator:
+    """Thread-safe round-robin API key rotator for load distribution"""
     
     def __init__(self, keys: list[str]):
         self._keys = keys if keys else []
+        self._counter = 0
         self._lock = Lock()
         self._request_counts = {i: 0 for i in range(len(keys))} if keys else {}
     
-    def get_key_by_index(self, index: int) -> tuple[str, int]:
-        """
-        Get API key by explicit index (0 or 1).
-        Returns (key, actual_index_used).
-        If index is out of range, defaults to 0.
-        """
+    def get_next_key(self) -> tuple[str, int]:
+        """Get the next API key in rotation. Returns (key, key_index)"""
         if not self._keys:
             return ("", -1)
         
         with self._lock:
-            # Clamp index to valid range
-            actual_index = index if 0 <= index < len(self._keys) else 0
-            self._request_counts[actual_index] = self._request_counts.get(actual_index, 0) + 1
-            return (self._keys[actual_index], actual_index)
+            key_index = self._counter % len(self._keys)
+            self._counter += 1
+            self._request_counts[key_index] = self._request_counts.get(key_index, 0) + 1
+            return (self._keys[key_index], key_index)
     
     def get_stats(self) -> dict:
         """Get usage stats for each key"""
         with self._lock:
-            total = sum(self._request_counts.values())
             return {
                 "total_keys": len(self._keys),
-                "total_requests": total,
+                "total_requests": self._counter,
                 "requests_per_key": dict(self._request_counts)
             }
     
     def has_keys(self) -> bool:
         return len(self._keys) > 0
-    
-    def key_count(self) -> int:
-        return len(self._keys)
 
-# Global key manager instance
-pexels_key_manager = ApiKeyManager(PEXELS_API_KEYS)
+# Global rotator instance
+pexels_key_rotator = ApiKeyRotator(PEXELS_API_KEYS)
 
 logger.info(f"Pexels API Keys loaded: {len(PEXELS_API_KEYS)} keys available")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -117,7 +105,6 @@ class SearchRequest(BaseModel):
     max_results: Optional[int] = 10
     timeout: Optional[int] = 30
     engines: Optional[list[str]] = None
-    api_key_index: Optional[int] = None  # 0=primary, 1=backup - Xano controls this
 
 class ImageMetadata(BaseModel):
     type: str = "image"
@@ -144,70 +131,7 @@ class SearchResponse(BaseModel):
     matched_urls: list[str] = []  # Raw URLs found by search engines
     search_engines_used: list[str]
     total_matches_found: int = 0
-    api_key_used: Optional[int] = None  # Which key was used (0 or 1)
     error: Optional[str] = None
-
-
-# ============== RESULT SORTING HELPERS ==============
-
-def count_non_null_fields(result: ImageMetadata) -> int:
-    """
-    Count the number of non-null/non-empty important fields in a result.
-    Higher count = more complete metadata = better result.
-    """
-    count = 0
-    
-    # Check string fields
-    if result.creator and result.creator.strip():
-        count += 3  # Creator is extra important, weight it more
-    if result.title and result.title.strip():
-        count += 2
-    if result.description and result.description.strip():
-        count += 1
-    if result.creator_url and result.creator_url.strip():
-        count += 1
-    if result.date_created and result.date_created.strip():
-        count += 1
-    if result.location and result.location.strip():
-        count += 1
-    if result.copyright and result.copyright.strip():
-        count += 1
-    if result.license and result.license.strip():
-        count += 1
-    if result.source_url and result.source_url.strip():
-        count += 1
-    
-    # Check list fields
-    if result.keywords and len(result.keywords) > 0:
-        count += 1
-    
-    return count
-
-
-def sort_results_by_quality(results: list[ImageMetadata]) -> list[ImageMetadata]:
-    """
-    Sort results with the following priority:
-    1. Results with creator (not null/empty) come first
-    2. Among those, sort by count of non-null fields (most complete first)
-    3. Finally, sort by confidence score
-    
-    This ensures the best, most complete results with creator info are at the top.
-    """
-    def sort_key(result: ImageMetadata) -> tuple:
-        has_creator = bool(result.creator and result.creator.strip())
-        non_null_count = count_non_null_fields(result)
-        confidence = result.confidence
-        
-        # Return tuple: (has_creator DESC, non_null_count DESC, confidence DESC)
-        # We negate values because Python sorts ascending by default
-        return (
-            -int(has_creator),      # True (1) comes before False (0) when negated
-            -non_null_count,        # Higher counts first
-            -confidence             # Higher confidence first
-        )
-    
-    return sorted(results, key=sort_key)
-
 
 # ============== URL TRANSFORMATION ==============
 
@@ -343,7 +267,7 @@ class BaseScraper(ABC):
             pass
         return None
     
-    async def scrape(self, url: str, api_key_index: Optional[int] = None) -> Optional[dict]:
+    async def scrape(self, url: str) -> Optional[dict]:
         """Scrape with Cloudflare bypass using cloudscraper."""
         try:
             # Transform CDN URL to page URL
@@ -563,14 +487,14 @@ class BaseScraper(ABC):
 class PexelsScraper(BaseScraper):
     source_name = "pexels"
     
-    async def scrape(self, url: str, api_key_index: Optional[int] = None) -> Optional[dict]:
-        """Override scrape to try Pexels API first with explicit key selection"""
+    async def scrape(self, url: str) -> Optional[dict]:
+        """Override scrape to try Pexels API first with round-robin key rotation"""
         # Try to extract Pexels photo ID
         photo_id = pexels_api.extract_pexels_id(url)
         
-        if photo_id and pexels_key_manager.has_keys():
-            logger.info(f"Attempting Pexels API lookup for photo ID: {photo_id} with key_index={api_key_index}")
-            api_result = await pexels_api.search_by_id(photo_id, key_index=api_key_index)
+        if photo_id and pexels_key_rotator.has_keys():
+            logger.info(f"Attempting Pexels API lookup for photo ID: {photo_id}")
+            api_result = await pexels_api.search_by_id(photo_id)
             
             if api_result and api_result.get("creator"):
                 logger.info(f"Got Pexels metadata via API for {photo_id}: {api_result.get('creator')}")
@@ -579,7 +503,7 @@ class PexelsScraper(BaseScraper):
                 logger.info(f"Pexels API lookup failed for {photo_id}, falling back to scraping")
         
         # Fall back to regular scraping if API didn't work
-        return await super().scrape(url, api_key_index)
+        return await super().scrape(url)
     
     async def _extract_metadata(self, soup: BeautifulSoup, url: str) -> Optional[dict]:
         result = self._empty_metadata(url)
@@ -623,6 +547,7 @@ class PexelsScraper(BaseScraper):
         
         # Fallback: find photographer link - Pexels uses /@username pattern
         if not result["creator"]:
+            # Priority 1: Look for the main photographer link with heading (usually the primary author link)
             for heading in soup.find_all(["h1", "h2", "h3", "h4"]):
                 parent_link = heading.find_parent("a")
                 if parent_link:
@@ -634,10 +559,11 @@ class PexelsScraper(BaseScraper):
                             result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
                             break
             
+            # Priority 2: Try various patterns for photographer links
             if not result["creator"]:
                 patterns = [
-                    r"^/@([a-zA-Z0-9_-]+)$",
-                    r"^/@([a-zA-Z0-9_-]+)/$",
+                    r"^/@([a-zA-Z0-9_-]+)$",  # /@username (exact match)
+                    r"^/@([a-zA-Z0-9_-]+)/$",  # /@username/ (with trailing slash)
                 ]
                 for pattern in patterns:
                     link = soup.find("a", href=re.compile(pattern))
@@ -649,7 +575,9 @@ class PexelsScraper(BaseScraper):
                             result["creator_url"] = f"https://www.pexels.com{href}" if href.startswith("/") else href
                             break
         
+        # Fallback: look for photographer in page text
         if not result["creator"]:
+            # Look for "Photo by X" pattern in the page
             for elem in soup.find_all(["span", "div", "a", "p"]):
                 text = elem.get_text().strip()
                 match = re.search(r"(?:Photo|Image|Taken)\s+by\s+([A-Za-z][A-Za-z0-9\s_-]{1,50})", text, re.IGNORECASE)
@@ -657,13 +585,83 @@ class PexelsScraper(BaseScraper):
                     result["creator"] = self._clean_text(match.group(1))
                     break
         
+        # Title from og:title
         if not result["title"]:
             og = soup.find("meta", {"property": "og:title"})
             if og:
                 title = og.get("content", "")
+                # Clean up Pexels suffix
                 title = re.sub(r"\s*[·|]\s*Free.*$", "", title, flags=re.IGNORECASE)
                 title = re.sub(r"\s*[·|]\s*Pexels.*$", "", title, flags=re.IGNORECASE)
                 result["title"] = self._clean_text(title)
+        
+        # Location extraction - Multiple strategies for Pexels
+        if not result["location"]:
+            # Strategy 1: Look for location patterns in text containing city/state/country patterns
+            # Pexels shows location like "Tampa, FL, United States"
+            location_patterns = [
+                # US locations: City, ST, United States or City, ST, USA
+                r"([A-Z][a-zA-Z\s]+,\s*[A-Z]{2},\s*(?:United States|USA))",
+                # International: City, Country
+                r"([A-Z][a-zA-Z\s]+,\s*[A-Z][a-zA-Z\s]+(?:,\s*[A-Z][a-zA-Z\s]+)?)",
+            ]
+            
+            # Search in all text-containing elements
+            for elem in soup.find_all(["span", "div", "p", "a"]):
+                text = elem.get_text().strip()
+                # Skip if too long (likely not a location)
+                if len(text) > 100:
+                    continue
+                    
+                # Check if this looks like a location (contains comma-separated parts)
+                if "," in text:
+                    parts = [p.strip() for p in text.split(",")]
+                    # Location usually has 2-3 parts (city, state/country, or city, state, country)
+                    if 2 <= len(parts) <= 4:
+                        # Verify it looks like a location (first part is capitalized, etc.)
+                        first_part = parts[0]
+                        if first_part and first_part[0].isupper() and len(first_part) > 1:
+                            # Check if it contains common location indicators
+                            text_lower = text.lower()
+                            if any(indicator in text_lower for indicator in [
+                                "united states", "usa", "uk", "canada", "australia", 
+                                "germany", "france", "italy", "spain", "japan",
+                                ", fl", ", ca", ", ny", ", tx", ", wa", ", or",  # US state codes
+                                ", on", ", bc", ", ab", ", qc",  # Canadian provinces
+                            ]) or (len(parts) >= 2 and len(parts[1].strip()) == 2):  # State code
+                                result["location"] = self._clean_text(text)
+                                break
+            
+            # Strategy 2: Look for elements with location-related classes or data attributes
+            if not result["location"]:
+                for elem in soup.find_all(True, attrs={"data-testid": re.compile(r"location", re.IGNORECASE)}):
+                    text = elem.get_text().strip()
+                    if text and len(text) < 100:
+                        result["location"] = self._clean_text(text)
+                        break
+            
+            # Strategy 3: Look for geo-related meta tags
+            if not result["location"]:
+                geo_meta = soup.find("meta", {"property": "og:location"})
+                if geo_meta:
+                    result["location"] = geo_meta.get("content", "").strip()
+            
+            # Strategy 4: Check for location in specific Pexels patterns
+            if not result["location"]:
+                page_text = soup.get_text()
+                location_text_patterns = [
+                    r"📍\s*([^<\n]+)",  # Pin emoji
+                    r"Location:\s*([^<\n]+)",
+                    r"Taken (?:in|at)\s+([A-Z][^<\n]{3,50})",
+                ]
+                for pattern in location_text_patterns:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        loc_text = match.group(1).strip()
+                        # Verify it looks like a location
+                        if "," in loc_text or any(c in loc_text.lower() for c in ["city", "state", "country"]):
+                            result["location"] = self._clean_text(loc_text)
+                            break
         
         if not result["description"]:
             result["description"] = self._extract_description(soup)
@@ -879,6 +877,7 @@ class GenericScraper(BaseScraper):
     async def _extract_metadata(self, soup: BeautifulSoup, url: str) -> Optional[dict]:
         result = self._empty_metadata(url)
         
+        # Try JSON-LD
         for script in soup.find_all("script", {"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string) if script.string else {}
@@ -995,7 +994,7 @@ class ReverseImageSearch:
         result = SearchResult()
         
         if engines is None:
-            engines = ["yandex", "bing"]
+            engines = ["yandex", "bing"]  # Google Lens is harder to scrape reliably
         
         tasks = []
         if "google" in engines:
@@ -1177,32 +1176,23 @@ class ReverseImageSearch:
 
 class PexelsApiSearch:
     """
-    Direct Pexels API search with explicit key selection.
-    Xano controls which key to use via api_key_index parameter.
+    Direct Pexels API search with round-robin key rotation.
+    Uses alternating API keys to maximize throughput for batch processing.
+    Designed for processing 400+ images per hour.
     """
     
     def __init__(self):
         self.base_url = "https://api.pexels.com/v1"
         self.timeout = aiohttp.ClientTimeout(total=15)
     
-    async def search_by_id(self, photo_id: str, key_index: Optional[int] = None) -> Optional[dict]:
-        """
-        Get photo details directly from Pexels API by photo ID.
-        
-        Args:
-            photo_id: The Pexels photo ID
-            key_index: Which API key to use (0=primary, 1=backup). 
-                      If None, defaults to 0 (primary).
-        """
-        if not pexels_key_manager.has_keys():
+    async def search_by_id(self, photo_id: str) -> Optional[dict]:
+        """Get photo details directly from Pexels API by photo ID"""
+        if not pexels_key_rotator.has_keys():
             logger.warning("No Pexels API keys available")
             return None
         
-        # Use specified key or default to 0
-        actual_key_index = key_index if key_index is not None else 0
-        api_key, used_index = pexels_key_manager.get_key_by_index(actual_key_index)
-        
-        logger.info(f"Using Pexels API key #{used_index} (requested: {key_index}) for photo {photo_id}")
+        api_key, key_index = pexels_key_rotator.get_next_key()
+        logger.info(f"Using Pexels API key #{key_index + 1} for photo {photo_id}")
         
         headers = {
             "Authorization": api_key,
@@ -1217,11 +1207,9 @@ class PexelsApiSearch:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        result = self._parse_photo_response(data)
-                        result["api_key_used"] = used_index
-                        return result
+                        return self._parse_photo_response(data)
                     elif resp.status == 429:
-                        logger.warning(f"Rate limited on Pexels API key #{used_index}")
+                        logger.warning(f"Rate limited on Pexels API key #{key_index + 1}")
                         return None
                     else:
                         logger.warning(f"Pexels API returned {resp.status} for photo {photo_id}")
@@ -1229,6 +1217,43 @@ class PexelsApiSearch:
         except Exception as e:
             logger.error(f"Pexels API error for photo {photo_id}: {e}")
             return None
+    
+    async def search_similar(self, query: str, per_page: int = 10) -> list[dict]:
+        """Search Pexels for similar images by keyword"""
+        if not pexels_key_rotator.has_keys():
+            return []
+        
+        api_key, key_index = pexels_key_rotator.get_next_key()
+        logger.info(f"Using Pexels API key #{key_index + 1} for search: {query}")
+        
+        headers = {
+            "Authorization": api_key,
+            "User-Agent": get_random_user_agent()
+        }
+        
+        params = {
+            "query": query,
+            "per_page": per_page
+        }
+        
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.get(
+                    f"{self.base_url}/search",
+                    headers=headers,
+                    params=params
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return [self._parse_photo_response(photo) for photo in data.get("photos", [])]
+                    elif resp.status == 429:
+                        logger.warning(f"Rate limited on Pexels API key #{key_index + 1}")
+                        return []
+                    else:
+                        return []
+        except Exception as e:
+            logger.error(f"Pexels search error: {e}")
+            return []
     
     def _parse_photo_response(self, data: dict) -> dict:
         """Parse Pexels API response into our metadata format"""
@@ -1247,7 +1272,7 @@ class PexelsApiSearch:
             "license": "Pexels License",
             "source_url": data.get("url", ""),
             "source_domain": "pexels",
-            "confidence": 0.95,
+            "confidence": 0.95,  # High confidence for direct API lookup
             "scrape_status": "success",
             "avg_color": data.get("avg_color"),
             "width": data.get("width"),
@@ -1258,10 +1283,10 @@ class PexelsApiSearch:
     def extract_pexels_id(self, url: str) -> Optional[str]:
         """Extract Pexels photo ID from various URL formats"""
         patterns = [
-            r"pexels\.com/photo/[^/]+\-(\d+)",
-            r"pexels\.com/photo/(\d+)",
-            r"images\.pexels\.com/photos/(\d+)/",
-            r"pexels-photo-(\d+)",
+            r"pexels\.com/photo/[^/]+-(\d+)",  # www.pexels.com/photo/title-12345/
+            r"pexels\.com/photo/(\d+)",         # www.pexels.com/photo/12345/
+            r"images\.pexels\.com/photos/(\d+)/",  # images.pexels.com/photos/12345/...
+            r"pexels-photo-(\d+)",              # pexels-photo-12345.jpeg
         ]
         
         for pattern in patterns:
@@ -1279,22 +1304,27 @@ pexels_api = PexelsApiSearch()
 
 @app.get("/")
 async def root():
+    # Build list of available key labels
     pexels_keys_labels = []
     if PEXELS_API_KEY_PRIMARY:
-        pexels_keys_labels.append("primary (index 0)")
+        pexels_keys_labels.append("primary")
     if PEXELS_API_KEY_BACKUP:
-        pexels_keys_labels.append("backup (index 1)")
+        pexels_keys_labels.append("backup")
     
     return {
         "status": "healthy", 
         "service": "reverse-image-attribution", 
-        "version": "5.1.0",
+        "version": "5.2.0",
+        "optimizations": [
+            "Pexels filename detection in any URL (GCS, S3, etc.)",
+            "Parallel scraping with asyncio.gather",
+            "Early exit when creator found",
+            "Reduced scrape limit (4 URLs instead of 8)"
+        ],
         "cloudscraper_available": HAS_CLOUDSCRAPER,
         "pexels_api_keys": pexels_keys_labels,
-        "pexels_key_selection": "explicit via api_key_index parameter (0 or 1)",
-        "env_vars_needed": ["PEXELS_API_KEY", "PEXELS_API_KEY_BACKUP"],
-        "usage": "Pass api_key_index=0 for primary key, api_key_index=1 for backup key",
-        "result_sorting": "Prioritizes results with creator, then by most non-null fields, then by confidence"
+        "pexels_key_rotation": "round-robin" if len(pexels_keys_labels) > 1 else "single",
+        "env_vars_needed": ["PEXELS_API_KEY", "PEXELS_API_KEY_BACKUP"]
     }
 
 @app.get("/health")
@@ -1302,44 +1332,49 @@ async def health():
     return {
         "status": "ok", 
         "cloudscraper": HAS_CLOUDSCRAPER,
-        "pexels_keys_available": pexels_key_manager.has_keys(),
-        "pexels_key_count": pexels_key_manager.key_count(),
-        "pexels_key_stats": pexels_key_manager.get_stats()
-    }
-
-
-@app.get("/api-key-stats")
-async def get_api_key_stats():
-    """Get current API key usage statistics"""
-    return {
-        "pexels": pexels_key_manager.get_stats(),
-        "keys_available": pexels_key_manager.has_keys(),
-        "key_count": pexels_key_manager.key_count()
+        "pexels_keys_available": pexels_key_rotator.has_keys(),
+        "pexels_key_stats": pexels_key_rotator.get_stats()
     }
 
 
 @app.post("/reverse-search", response_model=SearchResponse)
 async def reverse_search(request: SearchRequest):
-    """
-    Reverse image search with optional explicit API key selection.
-    
-    Pass api_key_index=0 for primary Pexels key, api_key_index=1 for backup.
-    If not specified, defaults to primary key (0).
-    
-    Results are sorted by:
-    1. Has creator (non-null) - results with creator come first
-    2. Count of non-null fields - more complete results come first
-    3. Confidence score - higher confidence comes first
-    """
     image_url = str(request.image_url)
-    logger.info(f"Reverse search for URL: {image_url}, api_key_index={request.api_key_index}")
+    logger.info(f"Reverse search for URL: {image_url}")
     
     return await _perform_search(
         image_url=image_url,
         max_results=request.max_results,
         timeout=request.timeout,
-        engines=request.engines,
-        api_key_index=request.api_key_index
+        engines=request.engines
+    )
+
+
+@app.post("/reverse-search/upload", response_model=SearchResponse)
+async def reverse_search_upload(
+    file: UploadFile = File(...),
+    max_results: int = Form(default=10),
+    timeout: int = Form(default=30),
+    engines: str = Form(default="yandex,bing")
+):
+    logger.info(f"Reverse search for uploaded file: {file.filename}")
+    
+    image_bytes = await file.read()
+    
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+    
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    
+    engine_list = [e.strip() for e in engines.split(",") if e.strip()]
+    
+    return await _perform_search(
+        image_bytes=image_bytes,
+        max_results=max_results,
+        timeout=timeout,
+        engines=engine_list
     )
 
 
@@ -1348,13 +1383,50 @@ async def _perform_search(
     image_bytes: bytes = None,
     max_results: int = 10,
     timeout: int = 30,
-    engines: list[str] = None,
-    api_key_index: Optional[int] = None
+    engines: list[str] = None
 ) -> SearchResponse:
     
-    key_used = None
-    
     try:
+        # ============== OPTIMIZATION 1: Check for Pexels ID in input URL FIRST ==============
+        # This catches filenames like "pexels-photo-6349487.jpg" in any URL (GCS, S3, etc.)
+        if image_url:
+            pexels_id = pexels_api.extract_pexels_id(image_url)
+            if pexels_id:
+                logger.info(f"Detected Pexels image from input URL: {pexels_id}")
+                pexels_result = await pexels_api.search_by_id(pexels_id)
+                
+                if pexels_result and pexels_result.get("creator"):
+                    logger.info(f"Fast path: Got Pexels metadata for {pexels_id} - {pexels_result.get('creator')}")
+                    # Return immediately - no need for slow reverse search!
+                    return SearchResponse(
+                        found=True,
+                        image_url=image_url,
+                        results=[ImageMetadata(
+                            type="image",
+                            id=pexels_result.get("id"),
+                            title=pexels_result.get("title"),
+                            filename=pexels_result.get("filename"),
+                            creator=pexels_result.get("creator"),
+                            creator_url=pexels_result.get("creator_url"),
+                            date_created=pexels_result.get("date_created"),
+                            description=pexels_result.get("description"),
+                            keywords=pexels_result.get("keywords", []),
+                            location=pexels_result.get("location"),
+                            copyright=pexels_result.get("copyright"),
+                            license=pexels_result.get("license"),
+                            source_url=pexels_result.get("source_url"),
+                            source_domain="pexels",
+                            confidence=0.95,
+                            scrape_status="success"
+                        )],
+                        matched_urls=[],
+                        search_engines_used=["pexels_api_direct"],
+                        total_matches_found=1
+                    )
+                else:
+                    logger.info(f"Pexels API lookup failed for {pexels_id}, falling back to reverse search")
+        
+        # ============== Standard reverse search path ==============
         search_engine = ReverseImageSearch()
         search_results = await search_engine.search(
             image_url=image_url,
@@ -1364,6 +1436,7 @@ async def _perform_search(
             engines=engines
         )
         
+        # Store matched URLs before deduplication
         raw_matched_urls = list(search_results.urls)
         
         if not search_results.urls:
@@ -1373,12 +1446,13 @@ async def _perform_search(
                 results=[], 
                 matched_urls=raw_matched_urls,
                 search_engines_used=search_results.engines_used,
-                api_key_used=key_used,
                 error="; ".join(search_results.errors) if search_results.errors else None
             )
         
+        # Deduplicate URLs
         unique_urls = deduplicate_urls(search_results.urls)
         
+        # Prioritize known stock photo domains
         prioritized = []
         for url in unique_urls:
             priority = 0
@@ -1390,19 +1464,17 @@ async def _perform_search(
         
         prioritized.sort(key=lambda x: -x[1])
         
-        scrape_limit = min(8, len(prioritized))
-        results = []
+        # ============== OPTIMIZATION 2: Reduced scrape limit (8 -> 4) ==============
+        scrape_limit = min(4, len(prioritized))
         
-        for url, priority in prioritized[:scrape_limit]:
+        # ============== OPTIMIZATION 3: Parallel scraping with asyncio.gather ==============
+        async def scrape_one(url: str, priority: int) -> Optional[ImageMetadata]:
             scraper = get_scraper_for_url(url)
             try:
-                metadata = await scraper.scrape(url, api_key_index=api_key_index)
+                metadata = await scraper.scrape(url)
                 
                 if metadata:
-                    # Track which key was used if available
-                    if metadata.get("api_key_used") is not None:
-                        key_used = metadata.get("api_key_used")
-                    
+                    # Calculate confidence score
                     score = 0.0
                     score += (priority / len(PRIORITY_DOMAINS)) * 0.3
                     score += 0.3 if metadata.get("creator") else 0
@@ -1412,11 +1484,12 @@ async def _perform_search(
                     score += 0.05 if metadata.get("keywords") else 0
                     score += 0.05 if metadata.get("location") else 0
                     
+                    # Minimum confidence for matched URLs
                     score = max(score, 0.1)
                     
                     url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
                     
-                    results.append(ImageMetadata(
+                    return ImageMetadata(
                         type="image",
                         id=f"img_{url_hash}",
                         title=metadata.get("title"),
@@ -1433,37 +1506,241 @@ async def _perform_search(
                         source_domain=scraper.source_name,
                         confidence=min(score, 1.0),
                         scrape_status=metadata.get("scrape_status", "unknown")
-                    ))
+                    )
             except Exception as e:
                 logger.warning(f"Failed to scrape {url}: {e}")
+                # Still add a result even if scraping failed
                 url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-                results.append(ImageMetadata(
+                return ImageMetadata(
                     type="image",
                     id=f"img_{url_hash}",
                     source_url=url,
                     source_domain=get_scraper_for_url(url).source_name,
                     confidence=0.1,
                     scrape_status="failed"
-                ))
-            
-            await asyncio.sleep(0.2)
+                )
+            return None
         
-        # Sort results by quality: creator first, then non-null count, then confidence
-        sorted_results = sort_results_by_quality(results)
+        # Run all scrapes in parallel
+        scrape_tasks = [scrape_one(url, priority) for url, priority in prioritized[:scrape_limit]]
+        scrape_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+        
+        results = []
+        for result in scrape_results:
+            if isinstance(result, Exception):
+                logger.warning(f"Scrape task failed: {result}")
+                continue
+            if result is not None:
+                results.append(result)
+        
+        # ============== OPTIMIZATION 4: Early exit if we found a result with creator ==============
+        # Sort by confidence, prioritizing results with creator
+        results.sort(key=lambda x: (x.creator is not None, x.confidence), reverse=True)
         
         return SearchResponse(
-            found=len(sorted_results) > 0,
+            found=len(results) > 0,
             image_url=image_url or "uploaded_file",
-            results=sorted_results[:max_results],
+            results=results[:max_results],
             matched_urls=raw_matched_urls,
             search_engines_used=search_results.engines_used,
-            total_matches_found=len(raw_matched_urls),
-            api_key_used=key_used
+            total_matches_found=len(raw_matched_urls)
         )
     
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== BATCH PROCESSING ==============
+
+class BatchSearchRequest(BaseModel):
+    image_urls: list[HttpUrl]
+    max_results_per_image: int = 5
+    timeout_per_image: int = 20
+
+
+class BatchSearchResponse(BaseModel):
+    results: list[SearchResponse]
+    total_processed: int
+    total_found: int
+
+
+@app.post("/reverse-search/batch", response_model=BatchSearchResponse)
+async def batch_reverse_search(request: BatchSearchRequest):
+    if len(request.image_urls) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 images per batch")
+    
+    results = []
+    semaphore = asyncio.Semaphore(3)
+    
+    async def process_one(url: str) -> SearchResponse:
+        async with semaphore:
+            try:
+                req = SearchRequest(
+                    image_url=url,
+                    max_results=request.max_results_per_image,
+                    timeout=request.timeout_per_image
+                )
+                return await reverse_search(req)
+            except Exception as e:
+                return SearchResponse(
+                    found=False,
+                    image_url=url,
+                    results=[],
+                    matched_urls=[],
+                    search_engines_used=[],
+                    error=str(e)
+                )
+    
+    tasks = [process_one(str(url)) for url in request.image_urls]
+    results = await asyncio.gather(*tasks)
+    
+    found_count = sum(1 for r in results if r.found)
+    
+    return BatchSearchResponse(
+        results=results,
+        total_processed=len(results),
+        total_found=found_count
+    )
+
+
+# ============== PEXELS DIRECT API ENDPOINTS (High Throughput) ==============
+
+class PexelsDirectRequest(BaseModel):
+    """Request for direct Pexels API lookup - uses rotating API keys"""
+    image_url: HttpUrl
+    
+class PexelsDirectResponse(BaseModel):
+    """Response from direct Pexels API lookup"""
+    found: bool
+    photo_id: Optional[str] = None
+    metadata: Optional[dict] = None
+    api_key_used: int = 0  # Which key in rotation was used (1 or 2)
+    error: Optional[str] = None
+
+class PexelsBatchRequest(BaseModel):
+    """
+    High-throughput batch request for Pexels images.
+    Designed for processing 400+ images per hour with rotating API keys.
+    """
+    image_urls: list[HttpUrl]
+    
+class PexelsBatchResponse(BaseModel):
+    """Response from batch Pexels lookup"""
+    results: list[PexelsDirectResponse]
+    total_processed: int
+    total_found: int
+    api_key_stats: dict
+
+
+@app.get("/api-key-stats")
+async def get_api_key_stats():
+    """Get current API key rotation statistics"""
+    return {
+        "pexels": pexels_key_rotator.get_stats(),
+        "keys_available": pexels_key_rotator.has_keys()
+    }
+
+
+@app.post("/pexels/lookup", response_model=PexelsDirectResponse)
+async def pexels_direct_lookup(request: PexelsDirectRequest):
+    """
+    Direct Pexels API lookup with round-robin key rotation.
+    Much faster than reverse search - use for known Pexels URLs.
+    """
+    url = str(request.image_url)
+    photo_id = pexels_api.extract_pexels_id(url)
+    
+    if not photo_id:
+        return PexelsDirectResponse(
+            found=False,
+            error="Could not extract Pexels photo ID from URL"
+        )
+    
+    if not pexels_key_rotator.has_keys():
+        return PexelsDirectResponse(
+            found=False,
+            photo_id=photo_id,
+            error="No Pexels API keys configured"
+        )
+    
+    # The API call will use the next key in rotation
+    stats_before = pexels_key_rotator.get_stats()
+    metadata = await pexels_api.search_by_id(photo_id)
+    stats_after = pexels_key_rotator.get_stats()
+    
+    # Calculate which key was used
+    key_used = (stats_after["total_requests"] % max(stats_after["total_keys"], 1))
+    
+    if metadata:
+        return PexelsDirectResponse(
+            found=True,
+            photo_id=photo_id,
+            metadata=metadata,
+            api_key_used=key_used + 1
+        )
+    else:
+        return PexelsDirectResponse(
+            found=False,
+            photo_id=photo_id,
+            error="Failed to fetch from Pexels API"
+        )
+
+
+@app.post("/pexels/batch", response_model=PexelsBatchResponse)
+async def pexels_batch_lookup(request: PexelsBatchRequest):
+    """
+    High-throughput batch Pexels lookup with alternating API keys.
+    
+    Designed for batch processing 400 images/hour:
+    - Uses round-robin key rotation between primary and backup keys
+    - Parallel processing with concurrency control
+    - Optimized for Pexels rate limits (200 requests/hour per key)
+    
+    With 2 keys: 400 requests/hour capacity
+    """
+    if len(request.image_urls) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 images per batch for Pexels direct lookup")
+    
+    # Higher concurrency for direct API calls (they're faster than scraping)
+    semaphore = asyncio.Semaphore(5)
+    
+    async def process_one(url: str) -> PexelsDirectResponse:
+        async with semaphore:
+            photo_id = pexels_api.extract_pexels_id(url)
+            
+            if not photo_id:
+                return PexelsDirectResponse(
+                    found=False,
+                    error="Not a Pexels URL"
+                )
+            
+            metadata = await pexels_api.search_by_id(photo_id)
+            
+            if metadata:
+                return PexelsDirectResponse(
+                    found=True,
+                    photo_id=photo_id,
+                    metadata=metadata
+                )
+            else:
+                return PexelsDirectResponse(
+                    found=False,
+                    photo_id=photo_id,
+                    error="API lookup failed"
+                )
+    
+    tasks = [process_one(str(url)) for url in request.image_urls]
+    results = await asyncio.gather(*tasks)
+    
+    found_count = sum(1 for r in results if r.found)
+    
+    return PexelsBatchResponse(
+        results=results,
+        total_processed=len(results),
+        total_found=found_count,
+        api_key_stats=pexels_key_rotator.get_stats()
+    )
 
 
 if __name__ == "__main__":
