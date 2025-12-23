@@ -34,7 +34,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reverse Image Attribution API", version="5.2.0")
+app = FastAPI(title="Reverse Image Attribution API", version="5.2.1")
 
 # ============== PEXELS API KEY ROTATION ==============
 # Load API keys from environment
@@ -225,10 +225,19 @@ def deduplicate_urls(urls: list[str]) -> list[str]:
 
 # ============== SCRAPERS ==============
 
+# PRIORITIZE PEXELS FIRST - Most common source for user images
 PRIORITY_DOMAINS = [
-    "gettyimages.com", "shutterstock.com", "unsplash.com", "pexels.com", 
-    "pixabay.com", "flickr.com", "alamy.com", "istockphoto.com",
-    "stock.adobe.com", "500px.com", "depositphotos.com"
+    "pexels.com",        # PRIORITY #1 - Most common free stock source
+    "unsplash.com",      # PRIORITY #2
+    "pixabay.com",       # PRIORITY #3
+    "flickr.com",        # PRIORITY #4
+    "gettyimages.com",   # Paid sources lower priority
+    "shutterstock.com", 
+    "alamy.com", 
+    "istockphoto.com",
+    "stock.adobe.com", 
+    "500px.com", 
+    "depositphotos.com"
 ]
 
 class BaseScraper(ABC):
@@ -1283,7 +1292,7 @@ class PexelsApiSearch:
     def extract_pexels_id(self, url: str) -> Optional[str]:
         """Extract Pexels photo ID from various URL formats"""
         patterns = [
-            r"pexels\.com/photo/[^/]+-(\d+)",  # www.pexels.com/photo/title-12345/
+            r"pexels\.com/photo/[^/]+\-(\d+)",  # www.pexels.com/photo/title-12345/
             r"pexels\.com/photo/(\d+)",         # www.pexels.com/photo/12345/
             r"images\.pexels\.com/photos/(\d+)/",  # images.pexels.com/photos/12345/...
             r"pexels-photo-(\d+)",              # pexels-photo-12345.jpeg
@@ -1314,8 +1323,9 @@ async def root():
     return {
         "status": "healthy", 
         "service": "reverse-image-attribution", 
-        "version": "5.2.0",
+        "version": "5.2.1",
         "optimizations": [
+            "Pexels PRIORITIZED in domain order and result sorting",
             "Pexels filename detection in any URL (GCS, S3, etc.)",
             "Parallel scraping with asyncio.gather",
             "Early exit when creator found",
@@ -1452,7 +1462,7 @@ async def _perform_search(
         # Deduplicate URLs
         unique_urls = deduplicate_urls(search_results.urls)
         
-        # Prioritize known stock photo domains
+        # Prioritize known stock photo domains - PEXELS IS FIRST
         prioritized = []
         for url in unique_urls:
             priority = 0
@@ -1533,9 +1543,14 @@ async def _perform_search(
             if result is not None:
                 results.append(result)
         
-        # ============== OPTIMIZATION 4: Early exit if we found a result with creator ==============
-        # Sort by confidence, prioritizing results with creator
-        results.sort(key=lambda x: (x.creator is not None, x.confidence), reverse=True)
+        # ============== OPTIMIZATION 4: Sort results - PRIORITIZE PEXELS ==============
+        # Sort by: 1) Pexels first, 2) Has creator, 3) Confidence
+        def sort_key(x):
+            is_pexels = 1 if x.source_domain == "pexels" else 0
+            has_creator = 1 if x.creator else 0
+            return (is_pexels, has_creator, x.confidence)
+        
+        results.sort(key=sort_key, reverse=True)
         
         return SearchResponse(
             found=len(results) > 0,
